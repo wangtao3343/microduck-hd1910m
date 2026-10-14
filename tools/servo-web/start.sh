@@ -93,17 +93,27 @@ done
 [ -n "$SERIAL" ] && MODE="真机 · $SERIAL"
 
 URL="http://127.0.0.1:$PORT"
-echo "──────────────────────────────────────────────"
-echo " 舵机调试台 · $MODE"
-echo " $URL"
-echo " 局域网：http://$(hostname -I 2>/dev/null | awk '{print $1}'):$PORT"
-echo " 停：Ctrl-C"
-echo "──────────────────────────────────────────────"
+# 横幅只留两行：一行说是什么模式配哪个地址，一行说局域网地址和怎么停
+echo "舵机调试台 · $MODE"
+echo "$URL"
+LAN="$(hostname -I 2>/dev/null | awk '{print $1}')"
+[ -n "$LAN" ] && echo "局域网 http://$LAN:$PORT · Ctrl-C 停"
 
 # ---- 5. 有图形界面就顺手开一下浏览器 ----
+#     等网页真的能连上再开，不是「过 2 秒就开」：串口打不开时 server.py 会立刻退出，
+#     定时开的话浏览器已经弹出来了，指着一个连不上的页面。这里最多等 15 秒，等不到就不开。
+#     探测用 bash 自带的 /dev/tcp，不依赖 curl。
 if [ "${NO_OPEN:-0}" != "1" ] && command -v xdg-open >/dev/null 2>&1 \
         && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
-    ( sleep 2; xdg-open "$URL" >/dev/null 2>&1 || true ) &
+    (
+        for _ in $(seq 1 60); do
+            if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
+                xdg-open "$URL" >/dev/null 2>&1 || true
+                exit 0
+            fi
+            sleep 0.25
+        done
+    ) &
 fi
 
 exec "$VENV/bin/python" server.py "$@"

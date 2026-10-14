@@ -264,7 +264,7 @@ class StartupFallbackTests(ServerEnvironment):
     def test_unopenable_port_exits_without_fake_bus(self):
         fake, run, raised = self.run_main(["--port", str(self.tmp / "not-a-serial-port")])
         self.assertIsNotNone(raised, "串口打不开应当退出")
-        self.assertIn("假总线", str(raised))
+        self.assertIn("--fake", str(raised), "退出前要告诉人怎么才能跑模拟")
         fake.assert_not_called()
         run.assert_not_called()
 

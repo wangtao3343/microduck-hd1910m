@@ -37,7 +37,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # 调试台版本。改了前端或后端就加一：app.js 里的 PAGE_VERSION 要跟这里一样，
 # 页面连上后会比对，不一样就提示"页面是旧的，Ctrl+F5"。改动记在 README 的「版本」一节。
-VERSION = "0.16.0"
+VERSION = "0.16.1"
 # 本机（microduck-hd1910m）的舵机编号：右腿 1–5、左腿 6–10、头颈 11–15。
 # 映射的权威来源是仓库根的 radxa/installation.json（robotd 读的就是它）；
 # 关节顺序跟原项目一样是「左腿 → 颈/头/嘴 → 右腿」，只有编号不同。
@@ -253,6 +253,8 @@ LOG_N = 0
 LOG_DIR = os.path.join(HERE, "logs")
 LOG_CATS = ["系统", "总线", "运动", "校准", "寄存器", "姿态", "方向", "IMU"]   # 页面自己还有一类「页面」
 LEVEL_TAG = {"info": "", "warn": "[警告]", "error": "[错误]", "debug": "[调试]"}
+# 串口打不开时终端上只说一句人话，不甩 errno，也不把同一个端口名重复三遍
+_OPEN_WHY = {2: "设备不存在（USB 没插？）", 13: "没权限", 16: "被别的程序占着（robotd？）"}
 _log_io = threading.Lock()
 STREAM_HZ = 50
 FAKE_STREAM_HZ = 30    # 模拟模式不占总线，推快一点，3D 动起来顺
@@ -308,8 +310,12 @@ def open_bus(port, baud=None):
     try:
         bus = feetech.FeetechBus(port, baud)
     except Exception as e:
-        ports = "、".join(p["device"] for p in list_ports()) or "一个都没有"
-        msg = f"打不开 {port}：{type(e).__name__}: {e}；现在能看到的串口：{ports}"
+        # 异常原文（errno 和端口名各重复几遍那种）单独一行，只进日志文件。
+        log(f"打不开 {port}：{type(e).__name__}: {e}", "总线", "debug")
+        # 只列 USB 串口：/dev/ttyS0–31 是主板自带的，插拔 USB 不会变，列 32 个只会把有用的淹掉
+        usb = [p["device"] for p in list_ports() if not p["device"].startswith("/dev/ttyS")]
+        why = _OPEN_WHY.get(getattr(e, "errno", None)) or type(e).__name__
+        msg = f"打不开 {port}：{why}。" + (f"USB 串口有 {'、'.join(usb)}" if usb else "现在没看到 USB 串口")
         log(msg, "总线", "error")
         return {"ok": False, "msg": msg}
     bus.trace = bus_trace
@@ -364,7 +370,9 @@ def log(msg, cat="系统", level="info", exc=False):
             LOG_N += 1
             LOG.append({"n": LOG_N, "t": t, "cat": cat, "level": level, "msg": msg})
             del LOG[:-400]
-    print(line + ("\n" + tb.rstrip() if tb else ""), flush=True)
+            # print 必须待在这个 if 里面：debug 那一档装的是串口原始收发字节和每条收到的指令，
+            # 放到终端上就是刷屏。它本来就该「只进日志文件」（见 bus_trace 的说明）。
+            print(line + ("\n" + tb.rstrip() if tb else ""), flush=True)
     return line
 
 
@@ -1653,17 +1661,15 @@ def main(argv=None):
         raise SystemExit(f"IMU 配置错误：{exc}") from exc
     IDS = parse_ids(a.ids)
     BAUD = a.baud
-    log(f"舵机调试台 v{VERSION} 启动，日志写在 {log_path()}", "系统")
+    log(f"舵机调试台 v{VERSION} 启动，日志 logs/{os.path.basename(log_path())}", "系统")
     if a.fake:
         use_fake_bus("--fake")
     elif not a.port:
-        raise SystemExit("没给 --port：接真机要带一个串口（如 --port /dev/ttyUSB0，./start.sh 会补上）；"
-                         "只想看界面不动舵机，明写 --fake。")
+        raise SystemExit("没给 --port。接真机：./start.sh；只要界面不动舵机：明写 --fake。")
     elif not open_bus(a.port, a.baud)["ok"]:
-        # 串口打不开就直接退出。原因（含现在能看到的串口列表）上面那行已经写进日志了；
-        # 这儿不再偷偷换成假总线 —— 那会让页面显示 15 颗「在线」的虚拟舵机，看着像接上了。
-        raise SystemExit(f"打不开串口 {a.port}，已退出（没建假总线）。插好 USB 再启动；"
-                         f"要跑模拟请明写 --fake。原因见 {log_path()}")
+        # 串口打不开就直接退出，不换成假总线（否则页面会显示 15 颗并不存在的「在线」舵机）。
+        # 原因上一条 [总线][错误] 已经说了，这儿只说下一步怎么办。
+        raise SystemExit("插好 USB 再跑一次 ./start.sh；要看界面不动舵机就明写 --fake。")
     print(f"舵机调试台 v{VERSION} · 浏览器开 http://127.0.0.1:{a.http_port}  （局域网用本机 IP）", flush=True)
     uvicorn.run(app, host=a.host, port=a.http_port, log_level="warning")
 
