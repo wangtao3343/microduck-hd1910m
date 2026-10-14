@@ -4,12 +4,55 @@ import { ImuAttitude, eulerDegrees } from './imu_attitude.js';
 
 let imuAttitude = new ImuAttitude(), imuRevision = -1;
 const imuNumber = (n, digits = 0) => typeof n === 'number' && Number.isFinite(n) ? n.toFixed(digits) : '—';
-const imuVector = v => Array.isArray(v) && v.length === 3 ? v.map(n => imuNumber(n, 3)).join(' / ') : '—';
+/* 面板上带 ± 的那几个数：角度、加速度、角速度。两个讲究：
+   ① 先按显示精度取整、再判正负。「-0.0 和 0.0 老来回闪」就是这里来的 ——
+      角度在零点附近飘，-0.004 让 toFixed 印出 "-0.00"、+0.004 印出 "+0.00"，
+      同一堆零来回换脸。取整后 -0 加 0 归成 +0，落进 >= 0 那一支，就一直印 "+0.00"。
+      （直接对原数判 >= 0 没用：-0.004 本来就是负数，加了 0 还是负数。）
+   ② 正数带 +：一列数上下对齐时，+ / - 让「往哪边偏」不用看数字长度。 */
+const imuFixed = (n, digits = 2) => {
+  if (typeof n !== 'number' || !Number.isFinite(n)) return '—';
+  const r = Number(n.toFixed(digits)) + 0;
+  return (r >= 0 ? '+' : '') + r.toFixed(digits);
+};
+const imuVector = v => Array.isArray(v) && v.length === 3 ? v.map(n => imuFixed(n, 2)).join(' / ') : '—';
+/* 哪条路能填哪些格子。规矩是「这条路肯定填不上的，整格不画」——
+   挂个「—」看着像掉数据或者坏了，其实那条路上压根没这个量。
+   总线（ID 200 那 15 个字节）只捎陀螺 + 四元数 + 采样计数 + 状态位：
+   没有加速度、没有 SPI / FIFO 计数、没有参考电压。（板子的寄存器表里是有加速度的 ——
+   control_table.c 把 raw_accel 放在 136、spi_errors 在 172、fifo_overflows 在 176，
+   读回调读哪个地址都行；是现在读的那个窗口「地址 56 起 15 字节」避开了它们，
+   不是板子没这份数据。哪天要让总线也显示，改的是 imu200.py 去读哪个地址，不是这张表。）
+   live（J-Link / pyOCD）走整块 RAM 快照，上面全都有；demo 是软件合成的，
+   除了参考电压（那是调试口量的，合成不出来）也都有。 */
+const IMU_CAPS = {
+  bus: ['samples', 'hz', 'gyro', 'errImu'],
+  demo: ['samples', 'hz', 'accel', 'gyro', 'errImu', 'errSpi', 'errFifo'],
+  live: ['samples', 'hz', 'voltage', 'accel', 'gyro', 'errImu', 'errSpi', 'errFifo'],
+};
+let imuCapsShown;
+/* 收格子。先把填不上的整格收掉，再让分隔号跟着两边的邻居一起收 ——
+   不然收掉一格会剩下孤零零一个「·」。一行里格子全收光了，这一行也收掉。 */
+function renderImuCaps(caps) {
+  if (caps === imuCapsShown) return;   // 30 Hz 调进来，路没变就别碰 DOM（对比的是 IMU_CAPS 里那几个常量数组本身）
+  imuCapsShown = caps;
+  const fields = [...document.querySelectorAll('#imuPanel .imuF')];
+  for (const f of fields) f.hidden = !!caps && !caps.includes(f.dataset.cap);
+  for (const sep of document.querySelectorAll('#imuPanel .sep')) {
+    const prev = sep.previousElementSibling, next = sep.nextElementSibling;
+    sep.hidden = !prev || !next || prev.hidden || next.hidden;
+  }
+  for (const row of new Set(fields.map(f => f.parentElement)))
+    row.hidden = [...row.querySelectorAll('.imuF')].every(f => f.hidden);
+}
 function renderImu() {
-  $('imuPanel').hidden = !imuFeed.enabled; $('imuViewStatus').hidden = !imuFeed.enabled;
+  $('imuPanel').hidden = !imuFeed.enabled;
   if (!imuFeed.enabled) return;
-  $('imuMount').value = imuAttitude.mountName;
   const p = imuAttitude.latest || {}, valid = imuAttitude.valid, demo = p.mode === 'demo';
+  /* 先按当前这条路收起填不上的格子。还不知道走哪条（第一帧之前）就传 null，全都留着 ——
+     「还不知道」最多只到第一帧：服务器的每帧都带 backend / mode，连「正在连接」那帧也带
+     （imu_bridge.py 里那句 setdefault，就是为了别让标签先显示成 J-Link）。 */
+  renderImuCaps(demo ? IMU_CAPS.demo : p.backend ? (IMU_CAPS[p.backend] || IMU_CAPS.live) : null);
   $('imuMode').textContent = demo ? '演示 · 非硬件' : p.backend === 'bus' ? '总线 · ID 200' : p.backend === 'swd' ? `${p.probe_name || 'pyOCD'} · SWD` : 'J-Link · SWD';
   $('imuMode').style.color = demo ? 'var(--warn)' : 'var(--muted)';
   const status = valid ? (demo ? '演示跟随' : '实时跟随') :
@@ -17,16 +60,30 @@ function renderImu() {
   $('imuStatus').textContent = status; $('imuStatus').style.color = valid ? 'var(--acc)' : 'var(--warn)';
   $('imuZero').disabled = !valid; $('imuRaw').disabled = !valid;
   $('imuSamples').textContent = imuNumber(p.sample_count); $('imuHz').textContent = valid ? imuNumber(p.hz, 1) : '—';
-  $('imuVoltage').textContent = demo ? '—' : imuNumber(typeof p.voltage_mv === 'number' ? p.voltage_mv / 1000 : null, 3);
+  $('imuVoltage').textContent = imuNumber(typeof p.voltage_mv === 'number' ? p.voltage_mv / 1000 : null, 3);
   $('imuErrors').textContent = imuNumber(p.error ?? p.errors?.imu); $('imuSpiErrors').textContent = imuNumber(p.errors?.spi); $('imuFifoErrors').textContent = imuNumber(p.errors?.fifo);
   $('imuAccel').textContent = valid ? imuVector(p.accel_g) : '—'; $('imuGyro').textContent = valid ? imuVector(p.gyro_dps) : '—';
-  const angles = valid ? eulerDegrees(imuAttitude.target).map(n => n.toFixed(1)) : ['—', '—', '—'];
-  $('imuAngles').textContent = `横滚 ${angles[0]}° · 俯仰 ${angles[1]}° · 偏航 ${angles[2]}°`;
-  $('imuReference').textContent = (imuAttitude.raw ? '原始姿态（含安装方向转换）' : '相对姿态（首次有效数据自动归零）') + '；显示归零、安装方向仅影响本页，不改写板子或舵机。';
-  $('imuMessage').textContent = valid ? (demo ? '软件合成姿态，不是板子读数。' : p.message || '已收到有效姿态。') :
-    `${status}，躯干保留最后一帧；${imuFeed.connected ? p.message || '等待新的有效采样。' : '与服务的 WebSocket 已断开，正在重连。'}`;
-  $('imuViewStatus').textContent = `躯干 IMU：${status}${demo ? '（非硬件）' : ''}${valid ? '' : ' · 保留最后姿态'} · 关节：${showWhat === 'goal' ? '滑块目标' : '舵机位置'}${isServoDemo ? '（假总线）' : ''}`;
-  $('imuViewStatus').style.color = valid && !demo ? 'var(--muted)' : 'var(--warn)';
+  /* 三个数各占一个 span、由 #imuAngles 的 flex 撑开（style.css），不再用「 · 」当分隔号：
+     那三个「 · 」连空格白占 26px，而这一行是本块的主读数，字号不能一缩再缩 ——
+     腾出这 26px 才排得进 ±179.99° 这种三位数。撑开还有个好处：数值变宽变窄时
+     三段是往两边让，不是整行重新折行。*/
+  const angles = valid ? eulerDegrees(imuAttitude.target).map(n => imuFixed(n, 2)) : ['—', '—', '—'];
+  $('imuRoll').textContent = `横滚 ${angles[0]}°`;
+  $('imuPitch').textContent = `俯仰 ${angles[1]}°`;
+  $('imuYaw').textContent = `偏航 ${angles[2]}°`;
+  $('imuReference').textContent = (imuAttitude.raw ? '原始姿态' : '相对姿态（首次有效数据自动归零）') + '；显示归零只影响本页，不改写板子或舵机。';
+  /* 这行改成「出事了才说话」。正常打通时桥给的是一句
+     「正在读取真实板卡；姿态可跟随板子运动。」—— 而上一行的实时跟随徽章、参考电压、
+     读取 Hz 已经把同一件事说了三遍，再复述一句只是占地方，所以正常就整行收起来。
+     用 hidden 而不是写空字符串：空 <p> 还留着 2px 边距，收不干净。
+     真正只有这里看得到的，是故障那几句：错误码、快照时间戳不一致、采样过期多少毫秒。
+     桥在 live 那条路上只发那一句固定的话（imu_bridge.decode_snapshot 最后一个分支），
+     所以「有效且非演示」就等于没话说；哪天 live 路上开始带别的提示，改的是这里。*/
+  const note = valid
+    ? (demo ? '软件合成姿态，不是板子读数。' : '')
+    : `${status}，躯干保留最后一帧；${imuFeed.connected ? p.message || '等待新的有效采样。' : '与服务的 WebSocket 已断开，正在重连。'}`;
+  $('imuMessage').textContent = note;
+  $('imuMessage').hidden = !note;
 }
 function acceptImuFeed() {
   if (imuRevision === imuFeed.revision) return;
@@ -38,8 +95,10 @@ function acceptImuFeed() {
 }
 window.addEventListener('imu-feed', acceptImuFeed); acceptImuFeed();
 setInterval(() => { imuAttitude.expire(performance.now()); renderImu(); }, 250);
-$('imuMount').value = imuAttitude.mountName;
-$('imuMount').addEventListener('change', () => { imuAttitude.setMount($('imuMount').value); renderImu(); addLog(`姿态显示安装方向：${$('imuMount').selectedOptions[0].textContent}（仅本页）`, 'IMU'); });
+/* 安装方向那个下拉删了（8 个选项，实机用的一直是默认的 y90，没人动过；而且它本来就不保存，
+   刷新就回默认）。换基那步照旧，取的是 imu_attitude.js 里的 DEFAULT_MOUNT —— 芯片要是哪天
+   换个方向装，改那个常量就行，不必再从页面上选。setMount()/mountQuaternion() 留着：
+   test_imu_attitude.cjs 靠它们验换基的数学。*/
 $('imuZero').addEventListener('click', () => { if (imuAttitude.zero()) { renderImu(); addLog('IMU 当前姿态设为显示零位（仅本页，不写硬件）', 'IMU'); } });
 $('imuRaw').addEventListener('click', () => { if (imuAttitude.showRaw()) { renderImu(); addLog('IMU 切换到原始姿态显示（仅本页）', 'IMU'); } });
 // 整块姿态浮在 3D 画布上挡着鸭子，给个折叠：只藏细节和说明，标题与角度留下。

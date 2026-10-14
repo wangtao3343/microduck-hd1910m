@@ -34,25 +34,23 @@
     <section id="imuPanel" hidden>
       <h2>躯干姿态 · IMU <span id="imuMode" class="badge"></span><span id="imuStatus" class="badge" aria-live="polite">等待数据</span><button id="imuFold" type="button" title="只收起这块，IMU 照常读、3D 照常转">收起</button></h2>
 
-      <div id="imuAngles">横滚 —° · 俯仰 —° · 偏航 —°</div>
+      <div id="imuAngles"><span id="imuRoll">横滚 —°</span><span id="imuPitch">俯仰 —°</span><span id="imuYaw">偏航 —°</span></div>
       <div id="viewBtns">
         <button onclick="resetCam()">复位视角</button>
         <label class="muted" style="font-size:12px;background:var(--panel);padding:4px 8px;border-radius:6px">
           显示 <select id="showWhat" onchange="setShowWhat()"><option value="present">实际位置</option><option value="goal">滑块目标</option></select>
         </label>
       </div>
-      <div id="imuViewStatus" hidden aria-live="polite"></div>
-      <div class="row muted">采样 <b id="imuSamples">—</b> · 读取 <b id="imuHz">—</b> Hz · 参考电压 <b id="imuVoltage">—</b> V</div>
-      <div class="row muted">加速度 g <span id="imuAccel">—</span> · 角速度 °/s <span id="imuGyro">—</span></div>
-      <div class="row muted">错误：IMU <b id="imuErrors">—</b> · SPI <b id="imuSpiErrors">—</b> · FIFO <b id="imuFifoErrors">—</b></div>
-      <p class="muted" id="imuMessage">等待姿态数据；关节仍使用舵机数据。</p>
+      <!-- 每格数据包一层 .imuF、标上它要的是哪路数据（data-cap），「 · 」单独一个 .sep ——
+           viewer.js 的 renderImuCaps() 按当前这条路的能力表把填不上的整格收掉。
+           分隔号必须单独成元素：跟着格子一起收，才不会剩一个孤零零的「 · 」。
+           这里只标「谁跟谁一组」，能不能填是 viewer.js 里 IMU_CAPS 说了算。 -->
+      <div class="row muted"><span class="imuF" data-cap="samples">采样 <b id="imuSamples">—</b></span><span class="sep">·</span><span class="imuF" data-cap="hz">读取 <b id="imuHz">—</b> Hz</span><span class="sep">·</span><span class="imuF" data-cap="voltage">参考电压 <b id="imuVoltage">—</b> V</span></div>
+      <div class="row muted"><span class="imuF" data-cap="accel">加速度 g <span id="imuAccel">—</span></span><span class="sep">·</span><span class="imuF" data-cap="gyro">角速度 °/s <span id="imuGyro">—</span></span></div>
+      <div class="row muted"><span class="imuF" data-cap="errImu">错误：IMU <b id="imuErrors">—</b></span><span class="sep">·</span><span class="imuF" data-cap="errSpi">SPI <b id="imuSpiErrors">—</b></span><span class="sep">·</span><span class="imuF" data-cap="errFifo">FIFO <b id="imuFifoErrors">—</b></span></div>
+      <p class="muted" id="imuMessage" hidden></p>
       <div class="row">
-        <button id="imuZero" disabled>当前姿态显示归零</button><button id="imuRaw" disabled>原始姿态</button>
-        <label>安装方向 <select id="imuMount">
-          <option value="y90">默认：绕 Y +90°</option><option value="identity">X 向前 / Y 向左 / Z 向上</option>
-          <option value="z90">绕 Z +90°</option><option value="z180">绕 Z 180°</option><option value="z-90">绕 Z −90°</option>
-          <option value="x90">绕 X +90°</option><option value="x-90">绕 X −90°</option><option value="y-90">绕 Y −90°</option>
-        </select></label>
+        <button id="imuZero" disabled>相对姿态</button><button id="imuRaw" disabled>原始姿态</button>
       </div>
       <p class="muted" id="imuReference">首次有效数据自动设为显示零位；这些操作只影响本页，不改写板子或舵机。</p>
       <p class="muted">躯干按 IMU 四元数转，关节按舵机数据转。六轴偏航会漂移；没有位移、脚底接触测量。重心与脚底区域是模型估计，不能据此判断实物平衡。</p>
@@ -82,14 +80,15 @@
         <div class="tabPane" id="tabPose">
           <section>
             <div class="row">
-              过渡时间 <input type="number" id="rampSec" value="2" min="0" max="20" step="0.5" style="width:60px"> 秒
-              加速度 <input type="number" id="accReg" value="30" min="1" max="254" style="width:56px" title="寄存器 41，单位 8.7°/s²；越小越柔">
-              运动方式 <select id="moveMode"><option value="profile">平滑（舵机自己走梯形曲线）</option><option value="stream">流式（电脑 20 Hz 喂点，会抖）</option></select>
-              
-              <button class="danger" onclick="stopRamp()">停</button></div>
-            <div class="row" id="poseList"><span class="muted">还没有存的姿态</span></div>
-            <div class="row">名字 <input type="text" id="poseName" value="" style="width:140px">
-              <button onclick="savePose()">把当前实际位置存成姿态</button>
+              过渡时间 <input type="number" id="rampSec" value="2" min="0" max="20" step="0.5" style="width:52px"> 秒
+              加速度 <input type="number" id="accReg" value="30" min="1" max="254" style="width:52px" title="寄存器 41，单位 8.7°/s²；越小越柔">
+              运动方式 <select id="moveMode" title="平滑：舵机自己走梯形曲线；流式：电脑 20 Hz 喂点，会抖"><option value="profile">平滑</option><option value="stream">流式（会抖）</option></select>
+              <button class="danger" onclick="stopRamp()">停</button>
+            </div>
+            <div class="row">
+              <span id="poseList"><span class="muted">还没有存的姿态</span></span>
+              名字 <input type="text" id="poseName" value="" style="width:110px">
+              <button onclick="savePose()" title="把当前实际位置存成姿态">存成姿态</button>
             </div>
           </section>
           <section>

@@ -90,6 +90,10 @@
   .tq { width:18px; height:18px; accent-color:var(--acc); }
   .dir { width:22px; height:22px; padding:0; font-size:11px; line-height:20px; text-align:center; }
   .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:6px 0; }
+  /* 姿态按钮排在「名字」那一行的行首，跟它共用一行 —— 自己是 flex 而是 flex 项，
+     所以它内部再多姿态也只是自己这一格变高，不会把「名字 输入框 存成姿态」顶下去。
+     min-width:0 是给它能在窄栏里收缩的余地，不然 flex 项默认按内容撑开、宁可溢出也不缩。 */
+  #poseList { display:flex; flex-wrap:wrap; gap:8px; align-items:center; min-width:0; }
   .log { height:240px; overflow:auto; background:#0c110f; border:1px solid var(--line); border-radius:6px; padding:6px 8px; font-size:12px; white-space:pre-wrap; word-break:break-all; }
   .ll { padding:1px 0; } .ll .lt { color:var(--muted); } .ll .lc { color:#7fb2ff; }
   .ll.warn { color:var(--warn); } .ll.error { color:var(--bad); } .ll.warn .lc, .ll.error .lc { color:inherit; }
@@ -101,27 +105,33 @@
   .area-EEPROM { color:var(--warn); } .area-SRAM { color:var(--acc); } .area-反馈 { color:var(--muted); }
   .bad { color:var(--bad); } .muted { color:var(--muted); }
   #dumpWrap { max-height:420px; overflow:auto; }
-  /* 原来是自己浮在画布左上角的一行（还得算宽度躲开右边的姿态块），现在搬进 #imuPanel 当一行，不用再躲谁。
-     给个淡一点的底，跟里面按钮/下拉那种「小色块」一致，压在鸭子身上也读得清。 */
-  #imuViewStatus { margin:0 0 8px;padding:5px 8px;border-radius:6px;background:rgba(22,29,26,.55);font-size:12px;color:var(--warn); }
   /* 躯干姿态整块从右栏搬到 3D 画布上，浮在左上角，不占画布外的地方。
      bottom 让开底部滑块条（跟右边 tab 块让开的一样多），内容超了在框里自己滚，不往外顶。
      底透明：不糊住鸭子，字直接落在 3D 上。所以模糊和投影都去掉（它们本来就是「有底」才成立的效果），
      改靠文字阴影压住亮度 —— 鸭子本体是浅灰/黄的，没有阴影时那几行小字会读不出来。
      里面的按钮和下拉保持自己的不透明底，不然点哪儿都看不清。 */
-  #imuPanel { position:absolute;left:10px;top:44px;bottom:calc(var(--stripH) + 56px);width:min(340px,46%);overflow:auto;background:transparent;box-shadow:none;text-shadow:0 1px 3px rgba(0,0,0,.95),0 0 7px rgba(0,0,0,.8); }
+  /* 只说 top，不钉 bottom，高度就跟着内容走。原来两头都钉死，框一路拉到滑块条上方；
+     但这块后来瘦了（安装方向下拉删了、imuViewStatus 那一条没了、imuMessage 平时也收起来），
+     内容只占上半截，下面空出一大块带边框的空框。
+     max-height 顶替原来那条 bottom：能长到的高度跟以前一模一样（让开滑块条 --stripH
+     和它下面那行通栏的重心投影 44+12），超过了才在框里滚。 */
+  #imuPanel { position:absolute;left:10px;top:44px;width:min(340px,46%);max-height:calc(100% - 44px - var(--stripH) - 56px);overflow:auto;background:transparent;box-shadow:none;text-shadow:0 1px 3px rgba(0,0,0,.95),0 0 7px rgba(0,0,0,.8); }
   #imuPanel h2 { flex-wrap:wrap;padding-right:54px; }   /* 窄的时候标题和两个徽标换行，别挤成一坨；右边给折叠按钮留位置 */
   #imuFold { position:absolute;right:8px;top:8px;padding:2px 8px;font-size:11px; }
   /* 收起只留标题、角度行、以及视角那两个控件：后两者不是 IMU 读数，收起来还用得上 */
   #imuPanel.folded > *:not(h2):not(#imuAngles):not(#viewBtns) { display:none; }
-  #imuPanel.folded { bottom:auto;overflow:visible; }   /* 收起时不再撑到底，高度跟着内容走 */
+  #imuPanel.folded { overflow:visible; }   /* 收起时只剩三行，用不着滚 */
   #imuPanel .muted { font-size:12px; }
-  #imuAngles { font-size:16px; }
+  /* 主读数。原来是 16px 加「 · 」分隔的一整行，加了正负号和两位小数之后
+     这串在 314px 的栏宽里要 356px，只能折行 —— 缩到 13px、把分隔号换成 flex 的
+     空隙（26px 白省下来），±179.99° 三组也排得下。三段各自 nowrap，
+     免得数字中间被掰断。 */
+  #imuAngles { font-size:13px; display:flex; justify-content:space-between; gap:8px; }
+  #imuAngles > span { white-space:nowrap; }
   #imuMessage { overflow-wrap:anywhere; }
   /* 底部滑块条长到 222px 之后，这块的可用高度跟着矮了 22px，原来 6px 的行距正好把最后一段顶出去。
      这些 6px 的行距都是整块自己加的（section 里的 .row / p），压到 2px 省下 28px，一行不少还能全露出来。 */
   #imuPanel p, #imuPanel .row { margin:2px 0; }
-  #imuViewStatus { margin:0 0 6px; }
   #viewBtns { margin:2px 0 6px; }
   /* 窄屏（≤900px）没有浮的地方了：浮层压在 52vw 高的画布上根本没法用，
      所以这里把浮层全部取消，画布、躯干姿态块、右侧 tab 块、滑块条在 viewWrap 里按正常文档流上下排开，
