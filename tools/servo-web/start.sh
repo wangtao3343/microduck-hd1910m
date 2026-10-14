@@ -1,14 +1,24 @@
 #!/usr/bin/env bash
-# 舵机调试台一键启动。
+# 舵机调试台一键启动。默认接真机。
 #
-#   ./start.sh                          模拟模式：假总线 15 颗舵机 + 假 IMU 小板，不接硬件
-#   ./start.sh --port /dev/ttyUSB0      接真机（URT-2 插 USB）
-#   ./start.sh --port /dev/ttyUSB0 --imu-bus   真机 + 从总线读 ID 200 小板
+#   ./start.sh                          真机：/dev/ttyUSB0 + 从总线读 IMU 小板（ID 200）
+#   ./start.sh --port /dev/ttyACM0      真机，换串口
+#   ./start.sh --fake                   不接硬件，只看界面（假总线 15 颗舵机）
+#
+# 接真机前：URT-2 先插 USB 再给舵机上电；别让 robotd 同时占着这个串口。
+# 打不开串口时 server.py 会把原因写成错误日志（logs/ 和 stderr），页面顶栏也会提示，
+# 同时先退回假总线把页面起起来 —— 插好线在页面顶栏点「连接」就行，不用重启。
+# 小板没接或不应答也不影响舵机调试。
+#
+# 网页端口默认 9010，改第 3 节那个 PORT= 就行（会一并传给 server.py）。
+# 想临时换：./start.sh --http-port 9020，或 HTTP_PORT=9020 ./start.sh。
+# 直接跑 python server.py（不走本脚本）仍是它自己的默认 8080。
 #
 # 环境变量：
-#   PYTHON=python3.12   指定用哪个解释器建 venv
-#   NO_OPEN=1           别自动开浏览器
-#   HTTP_PORT=8080      换端口（等价于传 --http-port）
+#   SERVO_PORT=/dev/ttyACM0   默认串口（只在不带参数时生效，等价于 --port）
+#   PYTHON=python3.12         指定用哪个解释器建 venv
+#   NO_OPEN=1                 别自动开浏览器
+#   HTTP_PORT=9020            换网页端口（等价于传 --http-port）
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,33 +34,62 @@ if [ ! -x "$VENV/bin/python" ]; then
 fi
 
 # 依赖齐不齐，缺了才装 —— 每次启动都 pip install 会很慢
-if ! "$VENV/bin/python" -c "import starlette, uvicorn, serial" >/dev/null 2>&1; then
+if ! "$VENV/bin/python" -c "import starlette, uvicorn, serial, pytest, httpx" >/dev/null 2>&1; then
     echo "→ 装依赖（第一次要几十秒）"
     "$VENV/bin/pip" install -q --upgrade pip
     "$VENV/bin/pip" install -q -r requirements.txt
 fi
 
-# ---- 2. 不带参数 = 模拟模式 ----
-MODE="模拟（假总线 + 假小板）"
-if [ $# -eq 0 ]; then
-    set -- --fake --imu-bus
+# ---- 2. 默认接真机：缺 --port 就补默认串口，缺 --imu-* 就补 --imu-bus ----
+#     是「缺什么补什么」，不是「零参数才补」—— 否则 ./start.sh --http-port 9022
+#     这种会把串口弄丢，server.py 收到空 --port 就直接退回假总线了。
+#     明写 --fake（不想接硬件）时什么都不补；其余情况没给 --port 就一律补默认串口。
+#     --imu-swd / --imu-jlink 只换 IMU 的读法，跟舵机总线不冲突，所以照样补串口；
+#     只调 IMU 不想碰总线，那才用得上 --fake。
+want_fake=0
+have_serial=0
+have_imu=0
+for a in "$@"; do
+    case "$a" in
+        --fake)          want_fake=1 ;;
+        --port|--port=*) have_serial=1 ;;
+        --imu-*)         have_imu=1 ;;
+    esac
+done
+if [ "$want_fake" = 0 ]; then
+    [ "$have_serial" = 0 ] && set -- "$@" --port "${SERVO_PORT:-/dev/ttyUSB0}"
+    [ "$have_imu" = 0 ] && set -- "$@" --imu-bus
 fi
 
-# ---- 3. HTTP_PORT 环境变量：真把它变成 --http-port 传下去（参数里给了就以参数为准）----
-has_port=0
-for a in "$@"; do case "$a" in --http-port|--http-port=*) has_port=1 ;; esac; done
-if [ "$has_port" = 0 ] && [ -n "${HTTP_PORT:-}" ]; then
-    set -- "$@" --http-port "$HTTP_PORT"
-fi
-
-# ---- 4. 从参数里抠出端口，好在开服前就把网址打出来 ----
-PORT=8080
+# ---- 3. 网页端口：--http-port 参数 > HTTP_PORT 环境变量 > 这里的默认值 ----
+#     注意 server.py 自己的 --http-port 默认是 8080。只改这个变量而不把它传下去，
+#     横幅会打新端口、服务却还绑 8080 —— 所以下面定完就显式补一个 --http-port。
+PORT=9010
+have_http_arg=0
 prev=""
 for a in "$@"; do
-    [ "$prev" = "--http-port" ] && PORT="$a"
-    case "$a" in --http-port=*) PORT="${a#*=}" ;; esac
+    [ "$prev" = "--http-port" ] && { PORT="$a"; have_http_arg=1; }
+    case "$a" in --http-port=*) PORT="${a#*=}"; have_http_arg=1 ;; esac
     prev="$a"
 done
+if [ "$have_http_arg" = 0 ]; then
+    [ -n "${HTTP_PORT:-}" ] && PORT="$HTTP_PORT"
+    set -- "$@" --http-port "$PORT"
+fi
+
+# ---- 4. 认出串口和运行模式，好在开服前就把横幅打对 ----
+SERIAL=""
+MODE="真机"
+prev=""
+for a in "$@"; do
+    [ "$prev" = "--port" ] && SERIAL="$a"
+    case "$a" in
+        --fake)   MODE="模拟（假总线，不接硬件）" ;;
+        --port=*) SERIAL="${a#*=}" ;;
+    esac
+    prev="$a"
+done
+[ -n "$SERIAL" ] && MODE="真机 · $SERIAL"
 
 URL="http://127.0.0.1:$PORT"
 echo "──────────────────────────────────────────────"
@@ -60,7 +99,7 @@ echo " 局域网：http://$(hostname -I 2>/dev/null | awk '{print $1}'):$PORT"
 echo " 停：Ctrl-C"
 echo "──────────────────────────────────────────────"
 
-# ---- 4. 有图形界面就顺手开一下浏览器 ----
+# ---- 5. 有图形界面就顺手开一下浏览器 ----
 if [ "${NO_OPEN:-0}" != "1" ] && command -v xdg-open >/dev/null 2>&1 \
         && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
     ( sleep 2; xdg-open "$URL" >/dev/null 2>&1 || true ) &

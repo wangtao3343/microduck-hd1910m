@@ -150,7 +150,7 @@ python server.py --port COM5 --imu-swd                      # 舵机串口 + 真
 ### 无硬件回归检查
 
 ```bash
-pip install -r requirements-test.txt
+pip install -r requirements.txt     # 测试依赖（pytest / httpx）也在这个文件里
 python selftest.py
 python -m pytest test_feetech_sync.py test_imu_bridge.py test_imu_server.py test_imu_swd.py test_imu_bus.py test_sim.py test_servo_report.py
 node --test test_imu_attitude.cjs
@@ -175,10 +175,14 @@ Node.js 只用于前端数学测试，正常使用调试台不需要。固件主
 
 ## 版本
 
-页面标题旁显示版本号。页面和服务的版本不一致时标红，并提示先重启 `server.py` 再 Ctrl+F5；这通常是浏览器还在用旧页面。改代码时 `server.py` 的 `VERSION` 和 `index.html` 的 `PAGE_VERSION` 一起加。
+页面标题旁显示版本号。页面和服务的版本不一致时标红，并提示先重启 `server.py` 再 Ctrl+F5；这通常是浏览器还在用旧页面。改代码时 `server.py` 的 `VERSION` 和 `app.js` 的 `PAGE_VERSION` 一起加。
 
 | 版本 | 日期 | 改了什么 |
 |---|---|---|
+| 0.15.9 | 2026-10-14 | 右栏再分一层：15 颗舵机的滑块从右栏搬到画布**底部通栏**那条浮层，左腿 6–10 / 颈头嘴 11–15 / 右腿 1–5 三组并排（`#servoStrip`，`bottom:44px`、`height:var(--stripH)`，那个变量就写在 `style.css` 第一行，左边躯干姿态块和右边 tab 块的 `bottom` 都跟着它算）。一行从 55px 压到 ~32px：`.servo` 的 `row-gap` 归零（`gap:8px` 是行列都管的）、`.id`/`.val` 14→12px、`.track` 26→18、扭矩框和 ± 按钮各小一号、关节名 10px；「±：关节方向…」那串压成一行省略号（全文在 `title` 里）。剩下三块内容按「就近合并」合成三个 tab —— 官方姿势（含存的姿态）、校准（含单颗操作和寄存器 dump）、日志（原来在右栏最底下）。切 tab 只是加去 `hidden` 属性，里面滑块 / 日志 / 幽灵表照常由各自的老代码连读带写。⚠ 随之要补一条 `.tabPane[hidden] { display:none }`：浏览器自带的 `[hidden]{display:none}` 是按标签写的，优先级低于 `.tabPane{display:flex}` 这个类，不补的话三个 tab 的内容会全叠在一起。收到寄存器 dump 时自动切到「校准」tab（`showDump`）。日志的警告/错误角标跟着搬到「日志」那个 tab 按钮上。`viewer.js` 的 `homeCam()` 把视线中心从 `target.z 0.1` 压到 `0.02`，鸭子整体在画面上抬高约 80px，正好落在滑块条上方那片空白的中间。`--stripH` 从 200 加到 222（三组内容实测 218px）；`#imuPanel` 里那几处 6px 行距压到 2px（省下 32px），否则底部滑块条长高之后它最后一段会被切掉 |
+| 0.15.8 | 2026-10-14 | 右栏整块（左腿 / 颈头嘴 / 右腿 / 其它 ID / 姿态 / 官方姿势 / 一键校准 / 单颗操作 / 日志 / 寄存器）从页面右侧搬进 3D 画布，浮在画布右边，跟左边的躯干姿态块左右对称：同样 `top:44px`、同样全透明 + `text-shadow`，`max-height:calc(100% - 110px)`（那 110px 让给底部通栏的重心投影行）超了在框里自己滚。`section` 的底和边框都去掉才透得出鸭子；按钮 / 输入框 / 日志区保留自己的不透明底 —— 那些是控件，透不得。`.layout` 由两列网格改成整页 flex（`body` 也改成 flex 列），画布铺满一屏，页面不再多一条滚动条；`#view` 跟着改成绝对定位铺满（`inset:0`）—— 原来 three.js 写在 canvas 上的 `width`/`height` 属性会被当成固有尺寸，反过来把 `#viewWrap` 连同整页撑得比一屏还高（1400×900 下多 44px），`clientWidth`/`clientHeight` 照常，`viewer.js` 的 resize 不用改。画布从 648px 宽变成整页宽之后，鸭子正落在页面中间（1400 视口实测水平差 6px）。窄屏（≤900px）没地方浮了：取消全部浮层，画布 / 躯干姿态 / 右栏在 `#viewWrap` 里上下排开各自正常滚；「收起」按钮从绝对定位退回 `h2` 里（否则会按 `#viewWrap` 跑到画布右上角去）；`#hint` 和重心投影行改成贴窗口底边（重心行在 `viewer.js` 里加了 `id="comText"`，它那段定位写在行内样式里，只有 `!important` 压得住）。顺带删掉拆文件时多出来的一个空 `<div class="layout">` |
+| 0.15.7 | 2026-10-14 | 「躯干姿态 · IMU」整块从右栏搬进 3D 画布，浮在右上角：看鸭子姿态和看角度不用再来回扫两眼。样式上它绝对定位在 `#viewWrap` 里、半透明 + 模糊背景，`max-height:min(62%,calc(100% - 130px))` 卡住高度、内容超了自己滚，底下 130px 留给重心投影行和 `#hint`；`max-width:900px` 时改成贴底通栏、`max-height:52%`。标题行加了「收起 / 展开」（`#imuFold`，`viewer.js` 里 `addEventListener` 接线）：收起只留标题和横滚/俯仰/偏航那一行，纯显示开关，不碰 `imuAttitude`，3D 和读数照常。`#imuViewStatus` 那行一行状态跟这块同生共死，宽度收成 `min(80%,calc(100% - 366px))` 让开右边。占位文案里「上方选择的舵机数据」改成「舵机数据」—— 舵机那几栏已经不在它上方了。底改成全透明（`background:transparent`，跟着去掉 `backdrop-filter` 和 `box-shadow` —— 那两个是「有底」才成立的效果），字直接落在 3D 上、不糊住鸭子；鸭子本体是浅灰/黄的，所以加 `text-shadow` 压住亮度；里面的按钮和下拉保留自己的不透明底，否则点哪儿都看不清 |
+| 0.15.6 | 2026-10-14 | 前端从单文件拆开：`index.html` 里的 `<style>` → `style.css`，普通 `<script>` → `app.js`，`<script type="module">` → `viewer.js`（`index.html` 从 1042 行降到 183 行）。三个文件都是原样搬家、逐字节相同，作用域和执行顺序不变 —— 所以 31 个内联 `onclick` 照旧靠 `app.js` 的全局作用域工作，`viewer.js` 里 `import './imu_attitude.js'` 因为也在根路径上所以不用改。importmap 三行留在 HTML 里（外部 importmap 要 Chrome 133+）。`server.py` 加了白名单处理器 `asset` + `/style.css`、`/app.js`、`/viewer.js` 三条路由（不用 `StaticFiles`，免得把整个目录暴露出去）。另修「站姿」「缩起来」按钮找不到姿态：它们按 `name.includes(按钮文案)` 找，而 `poses/` 里的名字是「站」「缩」，导致「缩起来」静默不发、「站姿」掉进官方 `DEFAULT_POSITION` 兜底 —— 改成两边互相包含都算命中（相等优先）。顶部那排操作按钮套了 `header .actions`，独占整行 |
 | 0.15.5 | 2026-10-14 | 舵机编号换成 microduck-hd1910m 的 1–15（右腿 1–5、左腿 6–10、头颈 11–15，来源 `radxa/installation.json`）；原来写死的是上游项目的 20-24 / 30-34 / 10-14。关节顺序不变（左腿 → 颈/头/嘴 → 右腿），只是改号：`server.py` 的 `DEFAULT_IDS`/`JOINT_NAMES`/`OFFICIAL_FOLD`/`FOLD_CALIB`、`index.html` 的 `ORDER`/`CN`/`DEFAULT_POSITION`/`OFFICIAL_POSES`/灵动动作、`model/model.json` 的 `joint.id`、`build_model.py` 的 `JOINT_IDS`、`directions.json`、`poses/*.json`、`servo_report.py`、`readpose.py`、`selftest.py`、`test_sim.py`、`test_imu_bus.py`。滑块分组改成按关节名分（连续编号下按区间分不出左右腿），组内排序也从「按 ID 升序」改成按 `ORDER`（升序在新编号下是「踝→膝→髋」，反的）。另修 `feetech.py` 里 f-string 表达式带反斜杠的写法（Python 3.12 才允许，3.10 / 3.11 下直接是语法错误、整个工具起不来），只把那段字节拼接挪出 f-string，行为不变。**方向值没动**：`directions.json` 仍是 15 颗全 −1，但 `radxa/installation.json` 写的是 `neck_pitch`(12)、`head_pitch`(11) 为 +1，待实机核对 |
 | 0.15.4 | 2026-09-28 | 真实舵机状态回读与网页推送目标频率由 10 Hz 提高为 50 Hz；模拟模式保持 30 Hz，动作和使能逻辑不变 |
 | 0.15.3 | 2026-09-28 | 同步读取按应答包实际 ID 归档，修复缺一包后把后续正常应答连带判失败的问题；真实漏读仍保留，不靠增加重试隐藏；补充协议字节流回归测试 |
@@ -209,14 +213,17 @@ Node.js 只用于前端数学测试，正常使用调试台不需要。固件主
 
 | 文件 | 干什么 |
 |---|---|
-| `start.sh` | 一键启动：备好 venv 和依赖，不带参数就 `--fake --imu-bus`（模拟模式） |
+| `start.sh` | 一键启动：备好 venv 和依赖，不带参数就接真机（`/dev/ttyUSB0` + 总线读 ID 200）；不接硬件看界面用 `--fake` |
 | `server.py` | HTTP + WebSocket 服务，starlette + uvicorn |
 | `feetech.py` | 飞特协议：PING / READ / WRITE / SYNC_READ / SYNC_WRITE / REBOOT，寄存器名表 |
 | `sim_bus.py` / `selftest.py` | 协议级舵机模拟器 / 后端自检 |
 | `servo_report.py` / `test_servo_report.py` | 舵机体检（只读）/ 对着 `sim_bus` 的测试 |
 | `远程排查交接.md` | 给另一台电脑上的 AI 的排查、校准流程 |
 | `logs/` `calib/` | 运行日志、校准前的偏移备份，本机的，不进仓库 |
-| `index.html` | 单文件前端，three.js 从 CDN 来 |
+| `index.html` | 前端骨架：DOM + importmap（three.js 从 CDN 来）。CSS/JS 拆在下面三个文件里 |
+| `style.css` | 全部样式，从 `index.html` 的 `<style>` 原样搬出来 |
+| `app.js` | 主逻辑（滑块、总线操作、姿态、序列）。**普通脚本**，顶层函数落在全局，页面上的 `onclick` 靠它 |
+| `viewer.js` | three.js 场景 + IMU 面板。**ES 模块**（`type="module"`），`import` three 和 `imu_attitude.js` |
 | `imu_bridge.py` / `test_imu_bridge.py` | J-Link / pyOCD 读取、固件验证、样本解码及无硬件测试 |
 | `test_imu_swd.py` | `--imu-swd`（pyOCD）读取器测试：用假 pyocd 模块，不接探针 |
 | `imu_bus.py` / `test_imu_bus.py` | `--imu-bus`：从舵机总线解 ID 200 的块、出列/重试、假小板；测试走真 `feetech.py` + `sim_bus` + `imu200.SimImu200` |

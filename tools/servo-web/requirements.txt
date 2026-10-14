@@ -2,3 +2,8 @@ starlette>=0.37
 uvicorn[standard]>=0.29
 pyserial>=3.5
 numpy>=1.24   # 只有 build_model.py 用
+pytest>=8     # 跑 test_*.py / selftest.py 用
+httpx>=0.27   # starlette.testclient 的依赖，测试起服务要用
+
+# 可选，默认不装：
+# pyocd       只有 --imu-swd（用 pyOCD 读 IMU 板）才要

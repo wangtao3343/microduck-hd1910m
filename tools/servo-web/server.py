@@ -32,9 +32,9 @@ import feetech
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# 调试台版本。改了前端或后端就加一：index.html 里的 PAGE_VERSION 要跟这里一样，
+# 调试台版本。改了前端或后端就加一：app.js 里的 PAGE_VERSION 要跟这里一样，
 # 页面连上后会比对，不一样就提示"页面是旧的，Ctrl+F5"。改动记在 README 的「版本」一节。
-VERSION = "0.15.5"
+VERSION = "0.15.9"
 # 本机（microduck-hd1910m）的舵机编号：右腿 1–5、左腿 6–10、头颈 11–15。
 # 映射的权威来源是仓库根的 radxa/installation.json（robotd 读的就是它）；
 # 关节顺序跟原项目一样是「左腿 → 颈/头/嘴 → 右腿」，只有编号不同。
@@ -389,6 +389,19 @@ async def index(request):
 
 async def imu_attitude_file(request):
     return FileResponse(os.path.join(HERE, "imu_attitude.js"), media_type="text/javascript",
+                        headers={"Cache-Control": "no-store"})
+
+
+# 从 index.html 里拆出来的前端文件（页面用 <link> / <script src> 引）。
+# 白名单：不在表里的一律 404 —— 不用 StaticFiles(directory=HERE)，那会把这个目录整个暴露出去。
+ASSET_TYPES = {"style.css": "text/css", "app.js": "text/javascript", "viewer.js": "text/javascript"}
+
+
+async def asset(request):
+    name = os.path.basename(request.url.path)
+    if name not in ASSET_TYPES:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return FileResponse(os.path.join(HERE, name), media_type=ASSET_TYPES[name],
                         headers={"Cache-Control": "no-store"})
 
 
@@ -1535,6 +1548,9 @@ async def lifespan(app):
 
 app = Starlette(routes=[
     Route("/", index),
+    Route("/style.css", asset),
+    Route("/app.js", asset),
+    Route("/viewer.js", asset),
     Route("/imu_attitude.js", imu_attitude_file),
     Route("/api/info", info),
     Route("/api/poses", poses),
