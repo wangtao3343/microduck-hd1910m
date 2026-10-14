@@ -247,5 +247,48 @@ class ConfigTests(ServerEnvironment):
             run.assert_not_called()
 
 
+class StartupFallbackTests(ServerEnvironment):
+    """假总线只在明写 --fake 时才建。串口不存在不算理由 —— 那样页面会显示 15 颗并不存在的
+    「在线」舵机，看着像接上了，其实一条指令都没发出去。"""
+
+    def run_main(self, argv):
+        with patch.object(server, "use_fake_bus") as fake, \
+                patch.object(server.uvicorn, "run") as run:
+            try:
+                server.main(argv)
+                raised = None
+            except SystemExit as exc:
+                raised = exc
+        return fake, run, raised
+
+    def test_unopenable_port_exits_without_fake_bus(self):
+        fake, run, raised = self.run_main(["--port", str(self.tmp / "not-a-serial-port")])
+        self.assertIsNotNone(raised, "串口打不开应当退出")
+        self.assertIn("假总线", str(raised))
+        fake.assert_not_called()
+        run.assert_not_called()
+
+    def test_missing_port_exits_without_fake_bus(self):
+        fake, run, raised = self.run_main([])
+        self.assertIsNotNone(raised, "没给 --port 应当退出而不是跑模拟")
+        fake.assert_not_called()
+        run.assert_not_called()
+
+    def test_fake_flag_still_builds_fake_bus_and_serves(self):
+        fake, run, raised = self.run_main(["--fake"])
+        self.assertIsNone(raised)
+        fake.assert_called_once()
+        run.assert_called_once()
+
+    def test_openable_port_is_used_and_never_touches_fake_bus(self):
+        with patch.object(server, "open_bus", return_value={"ok": True, "msg": "ok"}) as bus, \
+                patch.object(server, "use_fake_bus") as fake, \
+                patch.object(server.uvicorn, "run") as run:
+            server.main(["--port", "COM7"])
+        self.assertEqual(bus.call_args[0][0], "COM7")
+        fake.assert_not_called()
+        run.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,9 @@
   python server.py --port /dev/ttyS2                # 板子上，走半双工转接板（先 sudo systemctl stop robotd）
   python server.py --fake                           # 没舵机，看界面
 然后浏览器开 http://<主机>:8080
+
+假总线只在明写 --fake 时才用。没给 --port、或给了但串口打不开（USB 没插、口号变了、
+被 robotd 占着），一律报错退出 —— 不会偷偷换成假总线让页面显示 15 颗并不存在的舵机。
 """
 import argparse
 import asyncio
@@ -34,7 +37,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # 调试台版本。改了前端或后端就加一：app.js 里的 PAGE_VERSION 要跟这里一样，
 # 页面连上后会比对，不一样就提示"页面是旧的，Ctrl+F5"。改动记在 README 的「版本」一节。
-VERSION = "0.15.9"
+VERSION = "0.16.0"
 # 本机（microduck-hd1910m）的舵机编号：右腿 1–5、左腿 6–10、头颈 11–15。
 # 映射的权威来源是仓库根的 radxa/installation.json（robotd 读的就是它）；
 # 关节顺序跟原项目一样是「左腿 → 颈/头/嘴 → 右腿」，只有编号不同。
@@ -299,7 +302,7 @@ def bus_trace(line):
 
 
 def open_bus(port, baud=None):
-    """打开串口并接管总线。失败不抛异常，返回 {ok, msg}，页面照样能用（假总线）。"""
+    """打开串口并接管总线。失败不抛异常，返回 {ok, msg} 并把原因写进日志，由调用方决定怎么办。"""
     global BUS, PORT, BAUD, PRESENT
     baud = baud or BAUD
     try:
@@ -324,15 +327,18 @@ def open_bus(port, baud=None):
     return {"ok": True, "msg": f"{port} 已连上，在线 {len(PRESENT)} 颗"}
 
 
-def fallback_fake(why):
-    """没有串口时退到假总线：页面照开，能看界面、看 3D，就是不动真舵机。"""
+def use_fake_bus(why):
+    """挂上假总线：15 颗虚拟舵机，能看界面、看 3D，就是不动真舵机。
+
+    只有明写 --fake 才走到这儿 —— 串口不存在不算理由，那种情况直接退出（见 main），
+    否则页面会显示 15 颗「在线」的虚拟舵机，看着像接上了，其实一条指令都没发出去。"""
     global BUS, PORT, PRESENT
     BUS, PORT = FakeBus(IDS), None
     PRESENT = list(IDS)
-    if imu_backend(IMU_SERVICE) == "bus":   # 启动参数 --imu-bus 但没串口：假总线上挂一块虚拟小板答 ID 200
+    if imu_backend(IMU_SERVICE) == "bus":   # --fake --imu-bus：假总线上挂一块虚拟小板答 ID 200
         import imu_bus
         BUS.imu200 = imu_bus.FakeImu200()
-    log(f"{why}，先用假总线把页面起起来；插好 USB 后在页面顶栏选串口点「连接」", "总线", "warn")
+    log(f"{why}，用假总线（15 颗虚拟舵机，不动真硬件）", "总线", "warn")
 
 
 def log_path():
@@ -1323,7 +1329,7 @@ def read_states_with_imu(ids, service):
         if service.probe_result(BUS.ping(imu_bus.IMU_ID) is not None):
             log("ID 200 的 PING 有应答了，重新跟舵机一起读", "IMU")
     if isinstance(BUS, FakeBus):
-        # 虚拟小板：启动参数 --fake --imu-bus 时 fallback_fake 挂上，或者页面「模拟」里接上
+        # 虚拟小板：--fake --imu-bus 时 use_fake_bus 挂上，或者页面「模拟」里接上
         st = BUS.states(servo_ids)
         got = BUS.sync_read([imu_bus.IMU_ID], imu_bus.BLOCK_ADDR, imu_bus.BLOCK_LEN) if with_imu else {}
     else:
@@ -1565,9 +1571,10 @@ def parse_args(argv=None):
     ap.add_argument("--port", help="串口，如 COM5 / /dev/ttyUSB0 / /dev/ttyS2")
     ap.add_argument("--baud", type=int, default=1_000_000)
     ap.add_argument("--ids", default=DEFAULT_IDS, help="要管的 ID，如 1-15")
-    ap.add_argument("--fake", action="store_true", help="不接舵机，界面演示")
+    ap.add_argument("--fake", action="store_true",
+                    help="挂 15 颗虚拟舵机，不动真硬件。只有明写这个才用假总线；串口打不开不会自动退到它")
     ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--http-port", type=int, default=8080)
+    ap.add_argument("--http-port", type=int, default=9090)
     imu = ap.add_mutually_exclusive_group()
     imu.add_argument("--imu-jlink", type=Path, metavar="CONFIG.json",
                      help="用本机配置文件启用 J-Link IMU 读数，数据仍走当前 /ws")
@@ -1647,12 +1654,16 @@ def main(argv=None):
     IDS = parse_ids(a.ids)
     BAUD = a.baud
     log(f"舵机调试台 v{VERSION} 启动，日志写在 {log_path()}", "系统")
-    if a.fake or not a.port:
-        fallback_fake("没给 --port（或用了 --fake）" if not a.port else "--fake")
+    if a.fake:
+        use_fake_bus("--fake")
+    elif not a.port:
+        raise SystemExit("没给 --port：接真机要带一个串口（如 --port /dev/ttyUSB0，./start.sh 会补上）；"
+                         "只想看界面不动舵机，明写 --fake。")
     elif not open_bus(a.port, a.baud)["ok"]:
-        # 串口打不开（USB 没插、口号变了、被别的程序占着）也要把页面起起来，
-        # 插好以后在页面顶栏选串口点「连接」就行，不用重启服务
-        fallback_fake(f"串口 {a.port} 打不开")
+        # 串口打不开就直接退出。原因（含现在能看到的串口列表）上面那行已经写进日志了；
+        # 这儿不再偷偷换成假总线 —— 那会让页面显示 15 颗「在线」的虚拟舵机，看着像接上了。
+        raise SystemExit(f"打不开串口 {a.port}，已退出（没建假总线）。插好 USB 再启动；"
+                         f"要跑模拟请明写 --fake。原因见 {log_path()}")
     print(f"舵机调试台 v{VERSION} · 浏览器开 http://127.0.0.1:{a.http_port}  （局域网用本机 IP）", flush=True)
     uvicorn.run(app, host=a.host, port=a.http_port, log_level="warning")
 
