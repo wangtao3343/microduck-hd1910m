@@ -37,7 +37,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # 调试台版本。改了前端或后端就加一：app.js 里的 PAGE_VERSION 要跟这里一样，
 # 页面连上后会比对，不一样就提示"页面是旧的，Ctrl+F5"。改动记在 README 的「版本」一节。
-VERSION = "0.16.1"
+VERSION = "0.16.3"
 # 本机（microduck-hd1910m）的舵机编号：右腿 1–5、左腿 6–10、头颈 11–15。
 # 映射的权威来源是仓库根的 radxa/installation.json（robotd 读的就是它）；
 # 关节顺序跟原项目一样是「左腿 → 颈/头/嘴 → 右腿」，只有编号不同。

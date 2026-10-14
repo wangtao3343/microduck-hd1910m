@@ -1,5 +1,5 @@
 // 跟 server.py 的 VERSION 一起改。连上后比对，不一致说明浏览器拿的是旧页面
-const PAGE_VERSION = "0.16.1";
+const PAGE_VERSION = "0.16.3";
 const $ = id => document.getElementById(id);
 const v = id => Number($(id).value);
 let ws, names = {}, present = [], ids = [], lastDump = null, sendTimer = {}, lastSent = {};
@@ -263,8 +263,12 @@ function calibRefText() {
   const p = posesCache.find(q => q.file === f);
   return p ? { ref: f, text: `姿态「${p.name}」（${f}）的样子` } : { ref: null, text: null };
 }
-// 零位、官方折叠都是 15 颗全标；存的姿态保留自己填的列表（缩着定不住的关节可能被拿掉了）
+// 用户自己动过基准下拉没有。没动过就一直默认「官方折叠」：零位 2048 要把鸭子悬空扶直，
+// 15 颗同时摆准不现实，而折叠能靠零件顶住自定位。动过就尊重他的选择，刷新姿态列表时不再改回去。
+let calibRefTouched = false;
+// 零位、官方折叠都是 15 颗全标；存的姿态保留自己填的列表（定不住的关节可能被拿掉了）
 function calibRefChanged() {
+  calibRefTouched = true;
   const f = $('calibRef').value;
   if (!f || f === '@official:FOLD') $('calibIds').value = '1-15';
   if (f === '@official:FOLD') {
@@ -458,9 +462,11 @@ function rampTo(goals, seconds) {
 }
 function fillCalibRef() {
   const sel = $('calibRef'), keep = sel.value;
-  sel.innerHTML = '<option value="">零位 2048（鸭子摆直）</option><option value="@official:FOLD">官方折叠（腿折好趴稳、头颈摆正）</option>';
+  // 官方折叠排第一：它不但是默认值，也是唯一一个「不用悬空扶」的基准
+  sel.innerHTML = '<option value="@official:FOLD">官方折叠（腿折好趴稳、头颈摆正）</option><option value="">零位 2048（鸭子摆直）</option>';
   posesCache.filter(p => !p.steps).forEach(p => { const o = document.createElement('option'); o.value = p.file; o.textContent = `姿态「${p.name}」· ${(p.time || '').slice(5, 16)}`; sel.appendChild(o); });
-  if ([...sel.options].some(o => o.value === keep)) sel.value = keep;
+  if (calibRefTouched && [...sel.options].some(o => o.value === keep)) sel.value = keep;
+  else sel.value = '@official:FOLD';
 }
 function renderPoses(list) {
   posesCache = list || [];

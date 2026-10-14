@@ -81,7 +81,6 @@
         </section>
         <div class="tabPane" id="tabPose">
           <section>
-            <h2>姿态 <span class="muted" style="font-weight:400">存在 poses/ 里，发之前弹确认；× 删除（挪进 poses/.trash/，能找回）</span></h2>
             <div class="row">过渡时间 <input type="number" id="rampSec" value="2" min="0" max="20" step="0.5" style="width:60px"> 秒
               运动方式 <select id="moveMode"><option value="profile">平滑（舵机自己走梯形曲线）</option><option value="stream">流式（电脑 20 Hz 喂点，会抖）</option></select>
               加速度 <input type="number" id="accReg" value="30" min="1" max="254" style="width:56px" title="寄存器 41，单位 8.7°/s²；越小越柔">
@@ -92,8 +91,8 @@
             </div>
           </section>
           <section>
-            <h2>官方姿势 <span class="muted" style="font-weight:400">microduck_rl scene.xml 的 keyframe，按每颗的 ± 换算；过渡时间用上面的</span></h2>
-            <div class="row">去
+            <h2>官方姿势 </h2>
+            <div class="row">
               <button onclick="goOfficial('INIT')" title="全部 2048：腿伸直、脚板垂直、头平视、嘴闭上">零位</button>
               <button onclick="goOfficial('STAND')" title="官方 STAND：髋 pitch ∓26°、踝 ±26°、颈 / 头 +20°">站</button>
               <button onclick="goOfficial('SIT')" title="官方 SIT：髋 pitch ∓30°、膝 ±60°、颈 29°、头 92°">坐</button>
@@ -101,29 +100,26 @@
               3D 叠加 <select id="ghostPose" onchange="setGhost()"><option value="">不叠</option><option value="INIT">零位</option><option value="STAND">站</option><option value="SIT">坐</option><option value="FOLD">折叠</option><option value="FOLD_CALIB">校准用折叠（头颈摆正）</option></select>
             </div>
             <div class="muted" style="font-size:12px;line-height:1.6">
-              3D 里蓝色半透明的是官方姿势，实体是舵机实际位置；下表是每颗差多少度（模型约定）。零点没校准好时，差值就是零点偏了多少。<br>
-              折叠：按精确网格算，官方几何里髋 90°、踝 0° 时膝折到 89.6° 踝就碰到大腿上的舵机，官方 90° 会顶进去 0.36°。按钮发的时候膝只折 88°，不顶着零件。
-              <b>零点没校准前别用「折叠」按钮</b>：膝差几度就顶上零件了，校准前要折，扭矩关着用手折。<br>
-              「校准用折叠」只能叠加不能发：腿跟官方折叠一样，头颈摆正、嘴闭上，就是「一键校准」选官方折叠时要摆的样子。
+              3D 里蓝色半透明的是官方姿势，实体是舵机实际位置；<br>
+              <b>零点没校准前别用「折叠」按钮</b>：防止零位未校准产生堵转烧舵机。
             </div>
             <div id="ghostTbl"></div>
           </section>
         </div>
         <div class="tabPane" id="tabCalib" hidden>
           <section>
-            <h2>一键校准 <span class="muted" style="font-weight:400">官方零位 = 每颗都是 2048，永远不变</span></h2>
+            <h2>一键校准</h2>
             <div class="muted" style="font-size:12px;line-height:1.7">
-              把鸭子摆成「基准」那个姿势，点按钮：每颗「现在的位置」的读数改成基准里的值（0x0B 指令，舵机自己存），关节不动。<br>
-              基准选<b>零位 2048</b>：扭矩开着用滑块调到腿伸直、脚板垂直、脖子竖直、头平视、嘴闭上，托住再点。<br>
-              基准选<b>官方折叠</b>（推荐）：鸭子折好趴稳，不用悬空扶。膝折到踝刚好贴上大腿舵机（靠零件顶住，每次都一样），髋 pitch 用直角尺摆到跟躯干垂直，
-              髋 yaw / roll、踝摆正，脖子竖直、头平视、嘴闭上（头颈不按官方折叠的 57°，摆正好对）。目标读数按官方角度和 ± 算，校完零点就是官方的 2048，存的姿态自动换算，15 颗一起标。
-              膝的目标按官方 1.57 rad（90.0°）算，官方几何里踝贴上大腿舵机是 89.6°，零点因此差约 0.36°（4 步），可以忽略。扭矩关着摆就行，校完扭矩还是关着；之后开扭矩会先把目标对准当前位置，不会跳。<br>
-              点按钮后先弹确认框，逐颗列出「现在 → 写成、差几度」。差 30° 以上的再确认一次：装舵盘时转了半圈没关系，照常校；方向 ± 设反了也会差这么多，那样校进去是错的，先核一下 ±。<br>
-              基准选<b>存的姿态</b>（比如「缩」）：鸭子自己缩着放稳，靠机械接触定位，不用手扶；零位还是官方的，别的代码不用加 offset。
-              缩着定不住的关节（髋 yaw / roll、头）别放进列表，或者先用滑块摆正。
+              把鸭子摆成基准姿势再点校准：每颗「现在的位置」读数改成基准值（0x0B，舵机自己存），关节不动。<br>
+              <b>官方折叠</b>（默认）：折好趴稳，不用悬空扶 —— 膝折到踝刚贴上大腿舵机就停（靠零件顶住，每次都一样），髋 pitch 用直角尺摆到跟躯干垂直，
+              髋 yaw / roll、踝摆正，脖子竖直、头平视、嘴闭上，15 颗一起标。<br>
+              <b>零位 2048</b> 得把鸭子悬空扶成腿伸直、脚板垂直，15 颗很难同时摆准；<b>存的姿态</b> 靠姿态自己的机械接触定位，
+              定不住的关节（髋 yaw / roll、头）别放进列表。<br>
+              点按钮先弹确认框，逐颗列「现在 → 写成、差几度」，差 30° 以上再确认一次：装舵盘时转了半圈照常校，
+              <b>方向 ± 设反了也差这么多，那样校进去的零点是错的</b>。
             </div>
             <div class="row">
-              基准 <select id="calibRef" onchange="calibRefChanged()"><option value="">零位 2048（鸭子摆直）</option></select>
+              基准 <select id="calibRef" onchange="calibRefChanged()"><option value="@official:FOLD">官方折叠（腿折好趴稳、头颈摆正）</option></select>
               校准哪些 <input type="text" id="calibIds" value="1-15" style="width:170px">
               <button class="danger" onclick="calibAll()">一键校准</button>
               <button onclick="if(confirm('把最近一次校准之前的偏移写回舵机？'))send({op:'calib_undo'})">撤销上一次</button>

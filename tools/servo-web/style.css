@@ -1,6 +1,14 @@
   /* --stripH：底部滑块条多高。左边 IMU 块、右边 tab 块的 bottom 都按它算出来，改这一个数就行 */
   :root { --stripH:222px; --bg:#0f1412; --panel:#161d1a; --line:#243029; --text:#e6ede9; --muted:#8fa098; --acc:#3df0a3; --warn:#f0b43d; --bad:#f05a5a; }
   * { box-sizing:border-box; }
+  /* 滚动条一律不画。全页有五个滚动区（tab 内容、底部每组滑块、IMU 面板、日志、寄存器表），
+     每个都只在自己框里滚很短一段，右边挂一根灰条比里面的内容还显眼；而且它一出现就吃掉
+     ~15px 宽，把本来就窄的那几栏挤得重新换行、行高跟着变。
+     滚动本身照旧：滚轮、触控板、方向键、拖动都还能滚，只是不画那根条。
+     scrollbar-width 是 Firefox 认的，::-webkit-scrollbar 是 Chromium/Safari 认的，两个都得写；
+     不带 * 的 ::-webkit-scrollbar 连 html 那条（整页滚动条）一起管，窄屏下右边才不会冒出一根。 */
+  * { scrollbar-width:none; }
+  ::-webkit-scrollbar { display:none; }
   body { margin:0; display:flex; flex-direction:column; min-height:100vh; background:var(--bg); color:var(--text); font:14px/1.45 "IBM Plex Mono","Consolas","PingFang SC","Microsoft YaHei",monospace; }
   header { display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; padding:8px 14px; border-bottom:1px solid var(--line); background:var(--panel); position:sticky; top:0; z-index:5; }
   header h1 { font-size:16px; margin:0 8px 0 0; font-weight:600; }
