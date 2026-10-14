@@ -1,5 +1,5 @@
 // 跟 server.py 的 VERSION 一起改。连上后比对，不一致说明浏览器拿的是旧页面
-const PAGE_VERSION = "0.16.3";
+const PAGE_VERSION = "0.16.4";
 const $ = id => document.getElementById(id);
 const v = id => Number($(id).value);
 let ws, names = {}, present = [], ids = [], lastDump = null, sendTimer = {}, lastSent = {};
@@ -18,7 +18,7 @@ function connect() {
     const m = JSON.parse(e.data);
     if (m.type === 'hello') {
       imuFeed.enabled=m.imu_enabled === true; imuFeed.connected=true; imuFeed.packet=null; announceImu();
-      showSimImu(m.sim_imu);
+      showSimImu(m.sim_imu); setCalibRound(m.calib_round);
       const sv = m.version || '旧版', same = sv === PAGE_VERSION;
       $('ver').textContent = same ? `v${PAGE_VERSION}` : `页面 v${PAGE_VERSION} · 服务 v${sv} 不一致`;
       $('ver').style.color = same ? '' : 'var(--bad)';
@@ -36,7 +36,7 @@ function connect() {
     else if (m.type === 'poses') renderPoses(m.poses);
     else if (m.type === 'dirs') { dirs = {}; for (const [k, v] of Object.entries(m.dirs || {})) dirs[k] = v; }
     else if (m.type === 'calib_result') showCalibResult(m);
-    else if (m.type === 'calib_plan') confirmCalib(m);
+    else if (m.type === 'calib_plan') { if (m.for === 'peek') showCalibPeek(m); else confirmCalib(m); }
     else if (m.type === 'torque') showTorqueResult(m);
     else if (m.type === 'goals_verify') { if (m.missing.length) hint(`ID ${m.missing.join(',')} 没收到目标位置，总线丢包，再发一次`); else if (m.attempts > 1) addLog(`目标写入：重发 ${m.attempts} 轮才全到`, '运动', 'warn'); }
     else if (m.type === 'state') update(m.states, m.stats);
@@ -151,6 +151,7 @@ function fillIdSelects() {
   const extra = present.filter(id => !ORDER.includes(id)).sort((a, b) => a - b);
   fillSelect($('opId'), [...ORDER.filter(id => ids.includes(id) || present.includes(id)), ...extra], idLabel);
   // 改 ID：旧 ID 只列在线的，非标准的排前面（新舵机出厂 ID 1 一般在这）；新 ID 列 15 个标准位，占用的标出来，默认第一个空位
+  fillSelect($('calibId'), [...ORDER.filter(id => ids.includes(id) || present.includes(id)), ...extra], idLabel);
   fillSelect($('oldId'), [...extra, ...ORDER.filter(id => present.includes(id))], idLabel);
   fillSelect($('newId'), ORDER, id => `${id} · ${CN[id]}${present.includes(id) ? '（已占用）' : ''}`, ORDER.find(id => !present.includes(id)));
 }
@@ -244,14 +245,6 @@ function update(states, stats) {
     + (peakOneId ? ` / 单颗 id${peakOneId} ${peakOne.toFixed(0)} mA` : '');
 }
 let frameTimes = [];
-function parseIdList(text) {
-  const out = [];
-  for (const part of text.split(',')) {
-    const p = part.trim(); if (!p) continue;
-    if (p.includes('-')) { const [a, b] = p.split('-').map(Number); for (let i = a; i <= b; i++) out.push(i); } else out.push(Number(p));
-  }
-  return out.filter(id => present.includes(id));
-}
 // 基准：'' = 零位 2048；'@official:FOLD' = 官方折叠；否则是 poses/ 里的文件名。这里只给摆法，
 // 每颗写成多少由服务端算（calib_plan），跟真校准用同一份，页面不再各算各的
 function calibRefText() {
@@ -266,26 +259,63 @@ function calibRefText() {
 // 用户自己动过基准下拉没有。没动过就一直默认「官方折叠」：零位 2048 要把鸭子悬空扶直，
 // 15 颗同时摆准不现实，而折叠能靠零件顶住自定位。动过就尊重他的选择，刷新姿态列表时不再改回去。
 let calibRefTouched = false;
-// 零位、官方折叠都是 15 颗全标；存的姿态保留自己填的列表（定不住的关节可能被拿掉了）
+// 这一颗该摆成什么样。官方姿势按关节类型查表（CN 里的「右髋 pitch」去掉左右就是 key）；
+// 存的姿态定不住哪颗是姿态自己的事，只能给一句话。
+const CALIB_HOW = {
+  '@official:FOLD': { 踝: '折到脚板跟小腿成直角', 膝: '折到踝刚贴上大腿舵机就停，别再往里顶',
+    髋pitch: '用直角尺把大腿摆到跟躯干垂直', 髋roll: '不外张、不往里夹', 髋yaw: '不外撇、不内扣',
+    '颈pitch': '脖子竖直', '头pitch': '平视朝正前', '头roll': '头不歪', '头yaw': '头朝正前', 嘴: '嘴闭上' },
+  '': { 踝: '腿伸直，脚板垂直', 膝: '腿伸直，别弯', 髋pitch: '腿伸直，大腿跟躯干成一条线',
+    髋roll: '不外张、不往里夹', 髋yaw: '不外撇、不内扣',
+    '颈pitch': '脖子竖直', '头pitch': '平视朝正前', '头roll': '头不歪', '头yaw': '头朝正前', 嘴: '嘴闭上' },
+};
+function calibHow(ref, id) {
+  if (!ref || ref === '@official:FOLD') return (CALIB_HOW[ref || ''] || {})[(CN[id] || '').replace(/^[左右]/, '').replace(' ', '')] || '';
+  const p = posesCache.find(q => q.file === ref);
+  return p ? `摆成「${p.name}」里的样子，这一颗得定得住` : '';
+}
+// 选完舵机把「这一颗该摆成什么样 + 现在读多少 → 目标多少」写出来。目标由服务端算（calib_plan），
+// 跟真校准用同一份，页面不自己算一遍。
+let calibPeek = null;
+function calibIdChanged() { peekCalib(); }
+function peekCalib() {
+  const id = v('calibId'), box = $('calibHow');
+  if (!id) { box.textContent = ''; calibPeek = null; return; }
+  const r = calibRefText(); if (!r.text) { box.textContent = '基准姿态找不到了，重新选'; return; }
+  calibPeek = id;
+  send({ op: 'calib_plan', ids: [id], ref: r.ref, for: 'peek', id });
+}
+function showCalibPeek(m) {
+  if (m.id !== calibPeek) return;                    // 选得快，回包乱序：只认最后选的那颗
+  const row = m.rows[0] || {}, how = calibHow(m.ref, m.id);
+  const now = row.pos === undefined || row.pos === null ? '读不到' : row.pos;
+  $('calibHow').textContent = `${how}　现在 ${now} → 目标 ${row.target ?? '—'}`;
+}
+// 一轮 = 连着校的这几颗共用一份备份，撤销能一次全退（服务端 round_add）。空轮次时按钮退回
+// 老行为「撤销最近一次」：服务重启过就没有轮次信息了，但 calib/ 里那份备份还在，还能撤。
+let calibRound = { ids: [] };
+function setCalibRound(info) {
+  calibRound = info && info.ids ? info : { ids: [] };
+  $('calibUndo').textContent = calibRound.ids.length ? `撤销整轮（已校 ${calibRound.ids.length} 颗）` : '撤销最近一次';
+}
+function undoCalib() {
+  const ids = calibRound.ids;
+  const what = ids.length ? `这一轮校过的 ${ids.length} 颗（${ids.join(' ')}）` : '最近一次校准';
+  if (!confirm(`把${what}的偏移写回校准前？`)) return;
+  send({ op: 'calib_undo' });
+}
 function calibRefChanged() {
   calibRefTouched = true;
   const f = $('calibRef').value;
-  if (!f || f === '@official:FOLD') $('calibIds').value = '1-15';
+  peekCalib();                                       // 换了基准，这一颗的目标就变了，重算
   if (f === '@official:FOLD') {
-    hint('官方折叠（头颈摆正）：膝折到踝刚贴上大腿舵机就停，髋 pitch 用直角尺摆垂直，髋 yaw/roll、踝、头颈摆正，嘴闭上，15 颗一起标。3D 叠加了要摆的样子');
+    hint('官方折叠（头颈摆正）：折好趴稳，一颗一颗摆、一颗一颗校。3D 叠加了要摆的样子');
     if (!$('ghostPose').value) { $('ghostPose').value = 'FOLD_CALIB'; setGhost(); }
   }
 }
 let calibPending = null;   // 点了校准、等服务端回预览
-function calibAll() {
-  const list = parseIdList($('calibIds').value);
-  if (!list.length) { hint('校准列表里没有在线的舵机'); return; }
-  const r = calibRefText(); if (!r.text) { hint('基准姿态找不到了，重新选'); return; }
-  calibPending = { for: 'all', ids: list, ref: r.ref, text: r.text };
-  send({ op: 'calib_plan', ids: list, ref: r.ref, for: 'all' });
-}
 function calibOne() {
-  const id = v('opId'), r = calibRefText(); if (!r.text) { hint('基准姿态找不到了，重新选'); return; }
+  const id = v('calibId'), r = calibRefText(); if (!r.text) { hint('基准姿态找不到了，重新选'); return; }
   calibPending = { for: 'one', id, ids: [id], ref: r.ref, text: r.text };
   send({ op: 'calib_plan', ids: [id], ref: r.ref, for: 'one', id });
 }
@@ -300,7 +330,7 @@ function confirmCalib(m) {
     : r.pos === null ? `${nm(r.id)}  读不到位置（目标 ${r.target}）`
     : `${nm(r.id)}  ${r.pos} → ${r.target}  差 ${deg(r.diff_deg)}${Math.abs(r.diff_deg) > m.big_deg ? '  ⚠️' : ''}`);
   const shifts = !p.ref || p.ref.startsWith('@official:');
-  const head = p.for === 'one' ? `只校准 ID ${p.id}（${CN[p.id] || ''}）` : `校准这 ${m.rows.length} 颗`;
+  const head = `校准 ID ${p.id}（${CN[p.id] || ''}）`;
   const tail = m.fake ? '\n\n模拟：只改虚拟舵机，备份放临时目录，不碰 calib/ 和存的姿态。'
     : '\n\n写进舵机 EEPROM；原来的偏移会备份，可以撤销' + (shifts ? '；存的其它姿态自动换算。' : '。');
   if (!confirm(`${head}\n\n确认鸭子已经摆成${p.text}\n\n现在 → 写成（差多少）：\n${lines.join('\n')}${tail}`)) return;
@@ -308,10 +338,10 @@ function confirmCalib(m) {
       + '常见两种原因：\n1. 装舵盘时转了半圈（或错了几个齿）：没关系，校准就是把它纠回来，照常校。\n'
       + '2. 这颗的方向 ± 设反了：折叠时 ±90° 的关节方向反了，也会差 180° 左右，这样校进去的零点是错的。\n\n'
       + '分不清就先取消：扭矩关着用手把这颗往一边掰一点，看 3D 里的关节是不是跟着往同一边转；不是就点这一行的 ± 改过来再校。\n\n确定照常校？')) return;
-  if (p.for === 'one') send({ op: 'calibrate', id: p.id, ref: p.ref });
-  else send({ op: 'calib_mid_all', ids: p.ids, ref: p.ref });
+  send({ op: 'calibrate', id: p.id, ref: p.ref });
 }
 function showCalibResult(m) {
+  setCalibRound(m.round);
   const bad = Object.entries(m.bad || {}), big = Object.keys(m.big || {});
   // 每颗的过程服务端已经逐行记了，这里只弹提示
   if (bad.length) hint(`${bad.length} 颗没成功：${bad.map(([k]) => k).join(' ')}，日志选「校准」看每颗卡在哪一步`);

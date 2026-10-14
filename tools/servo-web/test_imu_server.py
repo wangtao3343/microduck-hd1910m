@@ -39,7 +39,7 @@ class ServerEnvironment(unittest.TestCase):
         self.stack.enter_context(patch.multiple(
             server, LOG=[], LOG_N=0, LOG_DIR=str(self.tmp / "logs"),
             CLIENTS=set(), BUS=server.FakeBus([20]), IDS=[20], PRESENT=[20],
-            IMU_SERVICE=None, PORT=None, STREAM_HZ=20,
+            IMU_SERVICE=None, PORT=None, STREAM_HZ=20, CALIB_ROUND=None,
         ))
         self.stack.enter_context(patch.object(server, "list_ports", return_value=[]))
 

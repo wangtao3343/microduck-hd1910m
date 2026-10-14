@@ -37,7 +37,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # 调试台版本。改了前端或后端就加一：app.js 里的 PAGE_VERSION 要跟这里一样，
 # 页面连上后会比对，不一样就提示"页面是旧的，Ctrl+F5"。改动记在 README 的「版本」一节。
-VERSION = "0.16.3"
+VERSION = "0.16.4"
 # 本机（microduck-hd1910m）的舵机编号：右腿 1–5、左腿 6–10、头颈 11–15。
 # 映射的权威来源是仓库根的 radxa/installation.json（robotd 读的就是它）；
 # 关节顺序跟原项目一样是「左腿 → 颈/头/嘴 → 右腿」，只有编号不同。
@@ -475,6 +475,55 @@ def calib_dir():
     return SIM_CALIB_DIR
 
 
+# 这一轮逐颗校准用过的备份文件（按时间排好），见 round_add。进程内状态，服务重启就清空 ——
+# 那时「撤销」退回最近那一份，跟以前一样。
+CALIB_ROUND = None
+
+# 备份文件名的序号，只为保证唯一（见 backup_calibration）。同样只在进程内。
+_BACKUP_N = 0
+
+
+def round_add(fn, ids, ref):
+    """把刚存的那份备份挂进当前这一轮。
+
+    校准是「摆一颗、校一颗」，一颗一份备份 —— 一次撤销就只退得回最后一颗。把这些备份串成一轮，
+    一次撤销就能退回起点：绕开「必须所有颗同时摆到位」这个做不到的前提，又不丢掉「一次全退」。
+    基准换了就另起一轮：拿折叠校了一半再换成零位，那是两码事，得能分开撤。"""
+    global CALIB_ROUND
+    if CALIB_ROUND is None or CALIB_ROUND["ref"] != ref:
+        CALIB_ROUND = {"files": [], "ref": ref, "ids": []}
+    CALIB_ROUND["files"].append(fn)
+    CALIB_ROUND["ids"] = sorted(set(CALIB_ROUND["ids"]) | set(ids))
+
+
+def round_info():
+    """给页面看这一轮校到哪了：撤销按钮上那句「已校 N 颗」靠它，刷新页面也能接着显示。"""
+    if not CALIB_ROUND:
+        return {"ids": [], "ref": None}
+    return {"ids": list(CALIB_ROUND["ids"]), "ref": CALIB_ROUND["ref"]}
+
+
+def merged_backup(d, files):
+    """把一轮里的几份备份合成一份，够 _undo_calibration 用。
+
+    偏移取**最早**那份：那才是这一轮动手之前的状态，同一颗校过几次都得退回那儿。
+    deltas 反过来要**累加**：同一颗在几份里各挪过一次，存的姿态得按总位移挪回去。"""
+    servos, deltas, shifted, sim, time_s = {}, {}, [], False, ""
+    for fn in files:
+        with open(os.path.join(d, fn), encoding="utf-8") as f:
+            r = json.load(f)
+        time_s = time_s or r.get("time", "")
+        for k, row in r.get("servos", {}).items():
+            servos.setdefault(k, row)          # files 按时间排好，先到的就是最早的
+        for k, v in r.get("deltas", {}).items():
+            deltas[k] = deltas.get(k, 0) + v
+        for name in r.get("shifted", []):
+            if name not in shifted:
+                shifted.append(name)
+        sim = sim or bool(r.get("sim"))
+    return {"time": time_s, "servos": servos, "deltas": deltas, "shifted": shifted, "sim": sim}
+
+
 def backup_calibration(ids):
     """中位校准前把每颗的偏移（寄存器 31）、读数、扭矩、锁标志、固件版本记下来，撤销用。"""
     rows = {}
@@ -488,8 +537,15 @@ def backup_calibration(ids):
             log(f"#{i} 备份时读不到：{type(e).__name__}: {e}", "校准", "warn", exc=True)
     d = calib_dir()
     os.makedirs(d, exist_ok=True)
-    now = time.time()                                  # 带毫秒：同一秒点两次也不撞名，字典序 = 时间顺序
-    fn = f"eeprom-{time.strftime('%Y%m%d-%H%M%S', time.localtime(now))}{int(now * 1000) % 1000:03d}.json"
+    now = time.time()
+    # 名字得唯一，而且字典序 = 时间顺序（撤销要挑「最近那一份」）。
+    # 光靠毫秒不够：一颗校完用不了 1 ms，连着校几颗会撞成同一个名字，后一份把前一份盖掉 ——
+    # 轮次要按份数退回起点（见 merged_backup），盖掉就退不全了。
+    # 计数器补在毫秒后面：同一毫秒内它管先后，跨毫秒时毫秒那段排得更前，照样说了算。
+    global _BACKUP_N
+    _BACKUP_N += 1
+    fn = (f"eeprom-{time.strftime('%Y%m%d-%H%M%S', time.localtime(now))}"
+          f"{int(now * 1000) % 1000:03d}-{_BACKUP_N:03d}.json")
     with open(os.path.join(d, fn), "w", encoding="utf-8") as f:
         json.dump({"time": time.strftime("%Y-%m-%d %H:%M:%S"), "servos": rows}, f, ensure_ascii=False, indent=1)
     return fn, rows
@@ -827,6 +883,7 @@ def _calibrate_mid_all(ids, ref=None):
     shift = not pose_ref and not sim
     log(f"开始校准 {len(ids)} 颗到{name}：{ids}" + ("（模拟：只改虚拟舵机，备份放临时目录，存的姿态不挪）" if sim else ""), "校准")
     fn, before = backup_calibration(ids)
+    round_add(fn, ids, ref)
     log(f"原来的偏移、读数、扭矩、锁标志备份在 {'临时目录 ' + calib_dir() + os.sep if sim else 'calib/'}{fn}", "校准")
     probe_offset_sign(next((i for i in ids if "offset" in before.get(str(i), {})), ids[0]))
     ok, bad, deltas, big = [], {}, {}, {}
@@ -872,7 +929,7 @@ def _calibrate_mid_all(ids, ref=None):
     log(f"校准完（{name}）：成功 {len(ok)} 颗 {ok}" + (f"；失败 {len(bad)} 颗 {sorted(bad)}，原因见上面每颗那行" if bad else "")
         + f"；备份 {'临时目录（模拟）' if sim else 'calib/'}{fn}", "校准", "warn" if bad or big else "info")
     return {"type": "calib_result", "ok": ok, "bad": {str(k): v for k, v in bad.items()}, "backup": fn,
-            "big": {str(k): round(v, 1) for k, v in big.items()}}
+            "big": {str(k): round(v, 1) for k, v in big.items()}, "round": round_info()}
 
 
 def undo_calibration():
@@ -882,16 +939,24 @@ def undo_calibration():
 
 
 def _undo_calibration():
-    """把最近一次备份里的偏移写回去（关扭矩 → 解锁 → 写 31 → 加锁），目标位置改成当前读数，扭矩状态照旧。"""
+    """把这一轮的偏移写回去（关扭矩 → 解锁 → 写 31 → 加锁），目标位置改成当前读数，扭矩状态照旧。
+
+    一轮里可能有好几份备份（逐颗校准，一颗一份），先合成一份再撤，见 merged_backup。"""
+    global CALIB_ROUND
     d = calib_dir()
-    files = sorted(f for f in os.listdir(d) if f.startswith("eeprom-")) if os.path.isdir(d) else []
+    have = sorted(f for f in os.listdir(d) if f.startswith("eeprom-")) if os.path.isdir(d) else []
+    # 只认这一轮里、且还在盘上的那些。轮次里记的文件要是被手工挪走了，就当没这一轮
+    files = [f for f in CALIB_ROUND["files"] if f in set(have)] if CALIB_ROUND else []
+    if not files:
+        # 没有轮次信息（服务重启过，或者直接对着 calib/ 里的文件撤）：退回最近那一份，跟以前一样
+        files = have[-1:]
     if not files:
         log("没有可撤销的中位校准" + ("（模拟模式只撤销模拟里做的校准）" if is_fake() else ""), "校准", "warn")
-        return {"type": "calib_result", "ok": [], "bad": {}, "backup": None}
+        return {"type": "calib_result", "ok": [], "bad": {}, "backup": None, "round": round_info()}
+    rec = merged_backup(d, files)
     fn = files[-1]
-    with open(os.path.join(d, fn), encoding="utf-8") as f:
-        rec = json.load(f)
-    log(f"开始撤销：把 calib/{fn}（{rec.get('time', '?')}）里的偏移写回去", "校准")
+    log(f"开始撤销：把 {len(files)} 份备份（{rec.get('time', '?')} 起，共 {len(rec['servos'])} 颗）里的偏移写回去"
+        if len(files) > 1 else f"开始撤销：把 calib/{fn}（{rec.get('time', '?')}）里的偏移写回去", "校准")
     ok, bad = [], {}
     for k, row in rec["servos"].items():
         i = int(k)
@@ -958,10 +1023,14 @@ def _undo_calibration():
             log(f"存的姿态换算回原来的零点：{moved}" + (f"（其中 {later} 是校准之后存的，按新零点存的也要挪）" if later else ""), "姿态")
     elif any(rec.get("deltas", {}).values()):
         log("这份备份是 0.8.0 以前的，没记当时挪了哪些姿态，姿态不自动挪回，需要的话手动核对", "姿态", "warn")
-    os.rename(os.path.join(d, fn), os.path.join(d, "undone-" + fn))
-    log(f"撤销完（{fn} 已改名 undone-{fn}）：{len(ok)} 颗偏移写回" + (f"；失败 {sorted(bad)}" if bad else ""),
+    for f in files:
+        # 这一轮用掉的每份都改名，免得下次「撤销」又挑中它
+        os.rename(os.path.join(d, f), os.path.join(d, "undone-" + f))
+    CALIB_ROUND = None                      # 撤完了，这一轮到此为止；下一颗校准另起一轮
+    log(f"撤销完（{'、'.join(files)} 已改名 undone-）：{len(ok)} 颗偏移写回" + (f"；失败 {sorted(bad)}" if bad else ""),
         "校准", "warn" if bad else "info")
-    return {"type": "calib_result", "ok": ok, "bad": {str(k): v for k, v in bad.items()}, "backup": fn}
+    return {"type": "calib_result", "ok": ok, "bad": {str(k): v for k, v in bad.items()}, "backup": fn,
+            "round": round_info()}
 
 
 def list_poses():
@@ -1411,7 +1480,9 @@ async def ws_endpoint(ws):
                                    "port": PORT, "ports": list_ports(),
                                    "regs": [[a, *feetech.REGISTERS[a]] for a in sorted(feetech.REGISTERS)],
                                    "version": VERSION, "imu_enabled": IMU_SERVICE is not None,
-                                   "sim_imu": sim_imu_mode()}))
+                                   "sim_imu": sim_imu_mode(),
+                                   # 刷新页面也接着显示「本轮已校 N 颗」——轮次活在服务端，不跟着页面走
+                                   "calib_round": round_info()}))
     CLIENTS.add(ws)  # hello 必须先于后台广播，前端先收到功能配置
     try:
         while True:

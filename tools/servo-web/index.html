@@ -81,9 +81,11 @@
         </section>
         <div class="tabPane" id="tabPose">
           <section>
-            <div class="row">过渡时间 <input type="number" id="rampSec" value="2" min="0" max="20" step="0.5" style="width:60px"> 秒
-              运动方式 <select id="moveMode"><option value="profile">平滑（舵机自己走梯形曲线）</option><option value="stream">流式（电脑 20 Hz 喂点，会抖）</option></select>
+            <div class="row">
+              过渡时间 <input type="number" id="rampSec" value="2" min="0" max="20" step="0.5" style="width:60px"> 秒
               加速度 <input type="number" id="accReg" value="30" min="1" max="254" style="width:56px" title="寄存器 41，单位 8.7°/s²；越小越柔">
+              运动方式 <select id="moveMode"><option value="profile">平滑（舵机自己走梯形曲线）</option><option value="stream">流式（电脑 20 Hz 喂点，会抖）</option></select>
+              
               <button class="danger" onclick="stopRamp()">停</button></div>
             <div class="row" id="poseList"><span class="muted">还没有存的姿态</span></div>
             <div class="row">名字 <input type="text" id="poseName" value="" style="width:140px">
@@ -108,21 +110,24 @@
         </div>
         <div class="tabPane" id="tabCalib" hidden>
           <section>
-            <h2>一键校准</h2>
+            <h2>校准 <span class="muted" style="font-weight:400">一颗一颗来：摆好一颗，校一颗</span></h2>
             <div class="muted" style="font-size:12px;line-height:1.7">
-              把鸭子摆成基准姿势再点校准：每颗「现在的位置」读数改成基准值（0x0B，舵机自己存），关节不动。<br>
-              <b>官方折叠</b>（默认）：折好趴稳，不用悬空扶 —— 膝折到踝刚贴上大腿舵机就停（靠零件顶住，每次都一样），髋 pitch 用直角尺摆到跟躯干垂直，
-              髋 yaw / roll、踝摆正，脖子竖直、头平视、嘴闭上，15 颗一起标。<br>
-              <b>零位 2048</b> 得把鸭子悬空扶成腿伸直、脚板垂直，15 颗很难同时摆准；<b>存的姿态</b> 靠姿态自己的机械接触定位，
-              定不住的关节（髋 yaw / roll、头）别放进列表。<br>
-              点按钮先弹确认框，逐颗列「现在 → 写成、差几度」，差 30° 以上再确认一次：装舵盘时转了半圈照常校，
-              <b>方向 ± 设反了也差这么多，那样校进去的零点是错的</b>。
+              校准只碰选中的这一颗，别的舵机照常撑着，所以<b>不用把所有颗同时摆到位</b> —— 摆好一颗校一颗就行。
+              校准就是让这颗「现在的位置」读成基准值（0x0B，舵机自己存），关节不动。<br>
+              <b>官方折叠</b>（默认）把鸭子折好趴稳，不用悬空扶；每颗该摆成什么样，选完舵机这行会写。
+              <b>零位 2048</b> 得把鸭子悬空扶成腿伸直、脚板垂直；<b>存的姿态</b> 靠那个姿态自己的机械接触定位。<br>
+              点按钮先弹确认框，列出这一颗「现在 → 写成、差几度」，差 30° 以上再确认一次：
+              一整轮校过的颗共用一份备份，<b>撤销整轮</b>能一次退回起点（不用一颗颗退）；换基准就算新的一轮。
             </div>
             <div class="row">
               基准 <select id="calibRef" onchange="calibRefChanged()"><option value="@official:FOLD">官方折叠（腿折好趴稳、头颈摆正）</option></select>
-              校准哪些 <input type="text" id="calibIds" value="1-15" style="width:170px">
-              <button class="danger" onclick="calibAll()">一键校准</button>
-              <button onclick="if(confirm('把最近一次校准之前的偏移写回舵机？'))send({op:'calib_undo'})">撤销上一次</button>
+            </div>
+            <div class="row">舵机 <select id="calibId" onchange="calibIdChanged()"></select>
+              <span class="muted" id="calibHow" style="font-size:12px"></span>
+            </div>
+            <div class="row">
+              <button class="danger" onclick="calibOne()">校准这一颗</button>
+              <button id="calibUndo" onclick="undoCalib()">撤销整轮</button>
             </div>
           </section>
           <section>
@@ -130,7 +135,6 @@
             <div class="row">舵机 <select id="opId"></select>
               <button onclick="send({op:'dump', id:v('opId')})">导出 0–86 寄存器</button>
               <button onclick="if(confirm('重启 ID '+v('opId')+'？会先关扭矩'))send({op:'reboot', id:v('opId')})">重启 0x08</button>
-              <button class="danger" onclick="calibOne()" title="按「一键校准」里选的基准，只校这一颗">校准这一颗</button>
             </div>
             <div class="row">改 ID：<select id="oldId" title="只列在线的；新舵机出厂 ID 一般是 1，先点下面「全网扫描」找到它"></select> → <select id="newId"></select>
               <button class="danger" onclick="setIdClick()">写 ID</button>

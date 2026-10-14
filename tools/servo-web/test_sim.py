@@ -214,7 +214,9 @@ class SimCalibrationTests(unittest.TestCase):
         self.bus = server.FakeBus(IDS)
         stack.enter_context(patch.multiple(server, BUS=self.bus, IDS=IDS, PRESENT=IDS, LOG=[], OFFSET_SIGN=None,
                                            CALIB_DIR=real_calib, POSES_DIR=poses, DIRS_FILE=dirs,
-                                           LOG_DIR=os.path.join(tmp, "logs"), SIM_CALIB_DIR=None))
+                                           LOG_DIR=os.path.join(tmp, "logs"), SIM_CALIB_DIR=None,
+                                           # 轮次是模块全局，不补的话会串到下一个用例去
+                                           CALIB_ROUND=None))
         self.real_calib = real_calib
 
     def fold_by_hand(self, errors=None):
@@ -255,6 +257,53 @@ class SimCalibrationTests(unittest.TestCase):
             self.clock.t += 0.01
             self.bus.states(IDS)
         self.assertTrue(all(self.bus.states([i])[i]["pos"] == 2048 for i in IDS))   # 不会甩回折叠
+
+    def test_one_undo_reverts_the_whole_per_servo_round(self):
+        """逐颗校准：摆一颗、校一颗，一颗一份备份。但撤销要一次退回起点 —— 不然得点 15 次，
+        而且点到第 14 次之前都停在一个「一半新零点、一半旧零点」的状态上。"""
+        before = self.fold_by_hand()
+        start = {i: self.bus.states([i])[i]["pos"] for i in IDS}
+        for i in (3, 8, 2):                                  # 一颗一颗校，跟页面上一样
+            r = server.handle({"op": "calibrate", "id": i, "ref": "@official:FOLD"})
+            self.assertEqual(r["ok"], [i])
+        self.assertEqual(len([f for f in os.listdir(server.SIM_CALIB_DIR) if f.startswith("eeprom-")]), 3)
+        self.assertEqual(server.round_info()["ids"], [2, 3, 8], "三颗都在同一轮里")
+        r = server.handle({"op": "calib_undo"})
+        self.assertEqual(sorted(r["ok"]), [2, 3, 8], "一轮里校过的三颗要一起退回")
+        st = self.bus.states(IDS)
+        for i in (3, 8, 2):                                  # 三颗都回到校准前的读数
+            self.assertEqual(st[i]["pos"], start[i], f"#{i} 没退回校准前")
+        self.assertTrue(all(self.bus.pos[i] == before[i] + 3 for i in IDS), "物理位置不该被动过")
+        self.assertEqual(server.round_info()["ids"], [], "撤完这一轮就结束了，下一次校准另起一轮")
+        left = [f for f in os.listdir(server.SIM_CALIB_DIR) if f.startswith("eeprom-")]
+        undone = [f for f in os.listdir(server.SIM_CALIB_DIR) if f.startswith("undone-")]
+        self.assertEqual((left, len(undone)), ([], 3), "这一轮每份都要改名，免得下次撤销又挑中它")
+
+    def test_changing_the_reference_starts_a_new_round(self):
+        """拿折叠校了一半再换零位，那是两码事：撤销不该把换基准之前的一起退掉。"""
+        self.fold_by_hand()
+        server.handle({"op": "calibrate", "id": 3, "ref": "@official:FOLD"})
+        self.assertEqual(server.round_info()["ids"], [3])
+        server.handle({"op": "calibrate", "id": 8, "ref": ""})          # 换基准 -> 新一轮
+        self.assertEqual(server.round_info()["ids"], [8])
+        r = server.handle({"op": "calib_undo"})
+        self.assertEqual(r["ok"], [8], "只退换基准之后那一轮")
+
+    def test_merged_backup_keeps_the_earliest_offset_and_sums_deltas(self):
+        """合并不是简单的「取最后一份」：偏移要最早的（动手之前的状态），
+        deltas 要累加（同一颗在几份里各挪过一次）。取错了撤销会退不到位。"""
+        self.assertEqual(server.merged_backup("", []), {
+            "time": "", "servos": {}, "deltas": {}, "shifted": [], "sim": False})
+        d = server.calib_dir()                             # 模拟模式的临时目录，第一次调用才建出来
+        for n, (off, delta) in enumerate(((11, 2), (22, 3)), 1):
+            with open(os.path.join(d, f"eeprom-20260101-00000{n}000.json"), "w", encoding="utf-8") as f:
+                json.dump({"time": f"2026-01-01 00:00:0{n}", "servos": {"7": {"offset": off}},
+                           "deltas": {"7": delta}, "shifted": [f"p{n}.json"]}, f)
+        rec = server.merged_backup(d, sorted(os.listdir(d)))
+        self.assertEqual(rec["servos"]["7"]["offset"], 11, "偏移要最早那份（动手之前的）")
+        self.assertEqual(rec["deltas"], {"7": 5}, "deltas 要累加")
+        self.assertEqual(rec["shifted"], ["p1.json", "p2.json"], "挪过的姿态取并集")
+        self.assertEqual(rec["time"], "2026-01-01 00:00:01", "时间取最早那份（撤销时用它找之后新存的姿态）")
 
     def test_sim_calibration_and_undo_never_touch_real_files(self):
         before = self.fold_by_hand()
