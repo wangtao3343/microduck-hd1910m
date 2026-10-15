@@ -9,6 +9,9 @@
 # 串口打不开（USB 没插、口号变了、被占着）server.py 会把原因写进日志和 stderr 然后直接退出，
 # 不会自己换成假总线 —— 那样页面会显示 15 颗并不存在的「在线」舵机。插好线重新跑本脚本即可。
 # 只想看界面不动舵机：明写 --fake。
+#
+# 串口「没权限」本脚本自己处理，不用重新登录：设备在（root:dialout 660）但当前会话读不了，
+# 就是 dialout 组刚加还没生效，这时借 sg dialout 原地重跑一次自己；没加过组就直说怎么加。
 # 小板没接或不应答也不影响舵机调试。
 #
 # 网页端口默认 9010，改第 3 节那个 PORT= 就行（会一并传给 server.py）。
@@ -20,9 +23,11 @@
 #   PYTHON=python3.12         指定用哪个解释器建 venv
 #   NO_OPEN=1                 别自动开浏览器
 #   HTTP_PORT=9020            换网页端口（等价于传 --http-port）
+#   SERVO_WEB_REGROUPED=1     内部用：已经在借组重跑，别再套一层 sg
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF="$HERE/$(basename "${BASH_SOURCE[0]}")"      # 借组重跑要用绝对路径，不能靠 $0
 cd "$HERE"
 
 VENV="$HERE/.venv"
@@ -91,6 +96,29 @@ for a in "$@"; do
     prev="$a"
 done
 [ -n "$SERIAL" ] && MODE="真机 · $SERIAL"
+
+# ---- 4.5 串口权限：设备在、当前会话却读不了，就是 dialout 组还没生效 ----
+#     典型场景：刚 sudo usermod -aG dialout $USER，没重新登录。文件在、权限 660 root:dialout，
+#     组也在 /etc/group 里了，但本会话的进程还是老凭证，server.py 只会甩一句「没权限」。
+#     已经在组里 → 借 sg dialout 原地重跑一次自己（SERVO_WEB_REGROUPED=1 保证只套一层）；
+#     没在组里（或没有 sg）→ 把怎么加组说清楚再退出。
+#     设备不存在时不接管：那是「USB 没插 / 口号变了」，让 server.py 照原样报。
+if [ "$want_fake" = 0 ] && [ -n "$SERIAL" ] && [ -e "$SERIAL" ] && [ ! -r "$SERIAL" ] \
+        && [ "${SERVO_WEB_REGROUPED:-0}" != 1 ]; then
+    # 注意用 id -nG 用户名（查 /etc/group），不能用 id -nG（那是本进程的凭证 —— 正是没生效的那个）
+    in_dialout=0
+    case " $(id -nG "$(id -un)") " in *" dialout "*) in_dialout=1 ;; esac
+    if [ "$in_dialout" = 1 ] && SG="$(command -v sg)"; then
+        echo "→ $SERIAL 当前会话读不了（dialout 组还没生效），借 sg dialout 重跑一次"
+        SERVO_WEB_REGROUPED=1 exec "$SG" dialout -c "$(printf '%q ' "$SELF" "$@")"
+    fi
+    {
+        echo "$SERIAL 打不开：$(id -un) 没有读写权限（属主一般是 root:dialout，权限 660）。"
+        echo "  修：sudo usermod -aG dialout $(id -un)   然后重新登录一次"
+        echo "  本次先凑合：sg dialout -c '$(printf '%q ' "$SELF" "$@")'"
+    } >&2
+    exit 1
+fi
 
 URL="http://127.0.0.1:$PORT"
 # 横幅只留两行：一行说是什么模式配哪个地址，一行说局域网地址和怎么停
