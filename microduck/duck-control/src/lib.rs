@@ -20,6 +20,8 @@ pub mod feetech;
 mod bno08x;
 #[cfg(target_os = "linux")]
 pub use bno08x::Bno08x;
+#[cfg(target_os = "linux")]
+pub use feetech::{ImuSource, ImuSourceKind};
 pub mod obs;
 pub mod policy;
 pub mod safety;

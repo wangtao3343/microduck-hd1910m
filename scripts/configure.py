@@ -34,7 +34,8 @@ def configure(output, calibration=None, port='/dev/hd1910-servo', motion=False, 
             raise ValueError('Use the actual verified device calibration; example is read-only')
         text = text.replace(old_bus, 'feetech:' + str(output / 'feetech.json'))
         config = dict(port=port, installation=str(calibration), imu_bus='/dev/i2c-4',
-                      imu_address=75, allow_motion=motion, servo_gain_profile='reference_runtime',
+                      imu_address=75, imu_source='i2c', allow_motion=motion,
+                      servo_gain_profile='reference_runtime',
                       scheduled_bus=True, reference_native=True)
         (output / 'feetech.json').write_text(json.dumps(config, indent=2) + '\n')
     (output / 'params.toml').write_text(text)

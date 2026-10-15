@@ -1,17 +1,17 @@
 //! Native attitude monitoring without inventing joint observations or opening a serial port.
 use super::*;
-use duck_control::Bno08x;
+use duck_control::{ImuSource, ImuSourceKind};
 use duck_control::imu::ImuData;
-use serde::Deserialize;
 
-fn open(path: &str) -> Result<Bno08x, Box<dyn std::error::Error>> {
+fn open(path: &str) -> Result<ImuSource, Box<dyn std::error::Error>> {
     let cfg: duck_control::feetech::Config = serde_json::from_slice(&std::fs::read(path)?)?;
     if cfg.allow_motion { return Err("IMU-only configuration must disable motion".into()); }
-    #[derive(Deserialize)]
-    struct Mount { imu_mount_wxyz: [f64; 4] }
-    let installation = PathBuf::from(path).parent().unwrap().join(cfg.installation);
-    let mount: Mount = serde_json::from_slice(&std::fs::read(installation)?)?;
-    Ok(Bno08x::open(&cfg.imu_bus, cfg.imu_address, mount.imu_mount_wxyz)?)
+    // 这条路**不开串口**（这个模块的名字就是承诺），所以舵机总线上那块小板在这里永远
+    // 没人喂。与其让它在 `ready` 上永远挂着，不如当场说清楚。
+    if cfg.imu_source != ImuSourceKind::I2c {
+        return Err("imu: 模式没有舵机总线可读，读不到总线上的 IMU 小板；请改用 feetech:，或把 imu_source 设回 \"i2c\"".into());
+    }
+    Ok(duck_control::feetech::ThreadedFeetechIo::open_imu(path)?)
 }
 
 fn frame(t: f64, imu: ImuData, age: f64, hz: f64) -> proto::RobotState {
@@ -33,7 +33,7 @@ fn frame(t: f64, imu: ImuData, age: f64, hz: f64) -> proto::RobotState {
     }
 }
 
-pub(super) fn publish_pending(imu: &Bno08x, state: &RobotState) {
+pub(super) fn publish_pending(imu: &ImuSource, state: &RobotState) {
     let Ok((sample, at)) = imu.snapshot() else { return; };
     let mut message = frame(state.started.elapsed().as_secs_f64(), sample,
         at.elapsed().as_secs_f64(), 0.);
@@ -41,7 +41,7 @@ pub(super) fn publish_pending(imu: &Bno08x, state: &RobotState) {
     let feedback = message.feedback.as_mut().unwrap();
     feedback["error"] = serde_json::json!(state.startup_error.load_full().as_deref());
     feedback["policy_enabled"] = serde_json::json!(false);
-    feedback["imu_transport"] = imu.report_stats().unwrap_or_default();
+    feedback["imu_transport"] = imu.report_stats();
     // Live attitude is not a control tick or evidence of motor readiness.
     let _ = state.state_tx.send(message);
 }
@@ -73,9 +73,7 @@ pub(super) async fn run(path: &str, state: Arc<RobotState>, period: Duration) {
                 }
                 let mut message = frame(state.started.elapsed().as_secs_f64(), sample,
                     at.elapsed().as_secs_f64(), f64::from_bits(state.achieved_hz.load(Ordering::Relaxed)));
-                if let Ok(stats) = imu.report_stats() {
-                    message.feedback.as_mut().unwrap()["imu_transport"] = stats;
-                }
+                message.feedback.as_mut().unwrap()["imu_transport"] = imu.report_stats();
                 let _ = state.state_tx.send(message);
             }
             Err(e) => {

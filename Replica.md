@@ -107,7 +107,7 @@ scripts   radxa   out/arm64
 
 `microduck/` 里的 Rust 源码在**开发机交叉编译**，**源码不上板**，只搬 `out/arm64/bin` 下的二进制。
 
-### 4.3 待修：板上端口配错了
+### 4.3 板上端口配错了（2026-10-15 已修）
 
 板上 `local/feetech.json` 写的是：
 
@@ -130,6 +130,10 @@ WARN robotd: waiting for native Feetech/BNO085; startup reads only
 
 再 `systemctl restart microduck-hd1910`。**改前先 `cp` 一份备份，改错了覆盖回去重启就还原。**
 
+> **2026-10-15**：改完了，板上现在是 `"port": "/dev/ttyS2"`，服务从 degraded 转 healthy。
+> 备份在 `local/feetech.json.bak-preimu`。**注意 `scripts/configure.py` 第 49 行的 `--port`
+> 默认值还是那个坏别名** —— 哪天重跑它配一遍，这个修复会被冲掉。
+
 启动路径全程只读（`sync_read` 读固件版本/限位/扭矩状态/增益，一次 `sync_write` 都没有），进控制循环前还会显式关扭矩，所以接管总线本身不会让舵机动。真正要动，得 `allow_motion` 为 true，而那要求 `installation.json` 里 `calibration_verified` 和 `imu_pose_verified` 都是 true —— 现在两个都是 false。
 
 ### 4.4 顺带记一笔：板上没有 BNO085
@@ -137,6 +141,8 @@ WARN robotd: waiting for native Feetech/BNO085; startup reads only
 `feetech.json` 里 `imu_bus: /dev/i2c-4`、`imu_address: 75` 是上游用 BNO085 的配置。这块板上 **i2c-4 整条总线是空的**（`i2cdetect -y 4` 全 `--`），IMU 是挂在**舵机总线上冒充 ID 200** 的那块小板。
 
 好在这不影响启动：`open_imu()` 只建对象、不校验芯片在不在，所以 IMU 缺失不会挡住 robotd，只是 `hardware_health.imu.ready` 会一直是 false。
+
+> **2026-10-15**：这条已经被第 6 节取代 —— 现在不用 BNO085 了，从总线读 ID 200。
 
 ## 5: 关节的正负方向（`direction`）
 
@@ -212,3 +218,101 @@ WARN robotd: waiting for native Feetech/BNO085; startup reads only
 **哪天想在你这台上跑这个电压实验**，正确做法是重新生成一份：用这台的 `installation.json` 采一份 `capture.jsonl`，跑 `calibrate_static_home.py` 输出到新目录（比如 `static_home_<日期>/`），不是就地改这一份。
 
 改上面那三处不影响任何现在能跑的东西（motion 还锁着），只是排掉一个埋着的雷。
+
+## 6: 让 IMU 走舵机总线（`imu_source`）
+
+### 6.1 为什么
+
+上游 `feetech.rs` 把 IMU 换成独立 I²C 上的 BNO085，这块板上没有那颗芯片，所以 IMU 一直死值、控制永远判为不可用。板上真 IMU 是 `imu_to_dxl` 小板：STM32 + LSM6DSV16X，挂在**舵机总线上冒充 ID 200**，数据块在地址 56、长度 15（= 舵机自己那个窗口），波特率跟舵机一样 1 Mbps。
+
+### 6.2 接口
+
+`feetech.json` 加一格：
+
+```json
+"imu_source": "bus"          // "i2c"（默认）| "bus"
+```
+
+`#[serde(default)]`，缺省 `i2c` —— 老配置不写这一格，行为跟以前**逐字一样**，还是走 BNO085。
+
+### 6.3 三个关键点
+
+**① 200 排最后，跟舵机共用同一条 `sync_read`。** 这不是性能问题，是电气问题：小板收到指令 50 µs 后就开口答（21 字节 = 210 µs），而**飞特舵机的自然应答延时比 50 µs 还短** —— 200 放前面时，舵机会在小板还在驱动半双工总线的时候就开口，两个器件同时驱动，字节互相冲掉，**每轮固定坏两帧**。200 排最后时小板走排队分支，等 15 颗答完再发，16 帧 336 B 全过，只多 210 µs。
+
+**② 寄存器 65 那条报警规则要给 200 开旁路。** 原代码有条规则：读的窗口跨过寄存器 65，就把 `row[65-address]` 当报警字节。三种帧形 `(40,31)` `(55,16)` `(56,15)` 下这一格**都**落在 IMU 块的**四元数 y 高字节**上 —— 不排除 200 的话，每帧都会误报一个报警。所以要按 id 判。
+
+**③ 小板缺席必须能降级，这是配套不是可选项。** 同包读意味着小板的死活进了舵机那次读的结果。连续 5 次因为它缺席而失败，就把 200 从请求表里摘掉、`imu_valid = false`，**舵机照读**；之后每 2 秒试挂回一次。全程**永不锁电机故障** —— 本仓库的既定态度是 IMU 坏了不能把电机带下去。
+
+### 6.4 mount：埋着 90° 的那一格
+
+**`installation.imu_mount_wxyz` 是配给 BNO085 的，不是配给小板的。** 这颗雷难排就在这里：两个都是**单位四元数**，所以 `BusImu::new` 的归一化那道闸**拦不住拿错**，只会静悄悄地把侧躺的重力喂给策略。
+
+| mount | 谁在用 | 站着时反推的重力 | 离正立 |
+|---|---|---|---|
+| `[√0.5, 0, √0.5, 0]`（`SflpDecoder::DEFAULT_MOUNT`） | `bus.rs`，以及现在的 bus 臂 | `[-0.08, -0.01, -1.00]` | **3.9–4.8°** ✅ |
+| `[0.5, -0.5, 0.5, -0.5]`（`installation.json`） | `Bno08x::open` —— 这格唯一真正的读者 | `[-0.08, -1.00, 0.01]` | 90.4° ❌ |
+
+反向也验过：鸭子侧躺时运行时报 `gravity = [-1, 0, 0]`、`fallen = true`；放正后自己清成 3.9°、`fallen = false`。**一正一反两次都对上**，这条钉死了。
+
+**`radxa/installation.json` 没动** —— 那一格对 BNO085 是对的。bus 那条路改成硬编码 `DEFAULT_MOUNT`，跟官方 `bus.rs` 读同一块小板时一致。加了测试 `the_bus_arm_uses_the_boards_own_mount_not_the_installations` 钉住，以后有人「顺手」把它接回安装文件那一格会当场红。
+
+### 6.5 上板部署：顺序不能反
+
+`Config` 是 `deny_unknown_fields`，所以**先送新二进制，再加配置项**。反过来 robotd 会直接拒绝加载配置，整个运行时起不来。
+
+```bash
+# 开发机：交叉编译（只有 robotd/robotctl 变了，app-server 没动）
+bash scripts/build.sh arm64
+
+# 板上：备份 → 停 → 送。配置先不动，确认新二进制本身没毛病
+ssh root@192.168.3.10
+  cp -a .../out/arm64/bin/robotd .../out/arm64/bin/robotd.bak-20261013
+  systemctl stop microduck-hd1910
+# 开发机：
+rsync -a --chown=duck:duck out/arm64/bin/robotd out/arm64/bin/robotctl \
+      root@192.168.3.10:/home/duck/workspace/microduck-hd1910m/out/arm64/bin/
+
+# 板上：先按现状起一次（预期还是报 BNO085，但进程活着）—— 把「新二进制的毛病」
+# 和「总线 IMU 的毛病」分开
+systemctl start microduck-hd1910
+
+# 板上：加 "imu_source": "bus"，再重启一次
+python3 -c '...'      # 改 local/feetech.json；备份留在 feetech.json.bak-preimu
+systemctl restart microduck-hd1910
+```
+
+**`--chown=duck:duck` 不能省**：以 root 直接 rsync 会把二进制写成 root 属主，而服务是 duck 跑的。
+
+回退：`mv robotd.bak-20261013 robotd` + 删掉那一格 + 重启。
+
+### 6.6 验收（2026-10-15 实测）
+
+| 项 | 结果 |
+|---|---|
+| `imu_valid` / `imu_age_s` | ✅ true / 1.5–6.3 ms（阈值 0.15 s） |
+| 有没有 `ID 200: alarm 0x??` | ✅ **0 次** —— 旁路①在真硬件上守住了 |
+| 姿态 | ✅ 站着 3.9°；`fallen` 随真实姿态 true↔false |
+| 读预算（`SCHEDULED_READ_BUDGET` = 12 ms） | ✅ `transport.read_ms = 5.27 ms` |
+| 出错率 | 54097 次读：`read_errors=2`、`misses=2`、`dropped=false`、`reconnects=0`、`frozen_run=0` |
+| 日志 | ✅ 切到 bus 之后一条 WARN/ERROR 都没有 |
+
+**两件没做/没说清的：**
+
+- **拔板测试**（计划里第 6 条）**没做**：小板的接法还没确认，如果它串在总线中间，拔它会连带断开后面的舵机。要做先看清接线。
+- `transport` 里有 **6 次 `incomplete feedback ... missing_ids=[15, 3]`**（54097 分之 6，0.011%）。缺的是**舵机 15 和 3，不是 200** —— 所以不是小板把舵机挤掉了。加小板之前是不是也这样，**没有基线，未知**；频率很低且自恢复（`recovery.attempts = 0`）。
+
+### 6.7 改了哪些、没 commit
+
+```
+duck-control/src/feetech.rs    imu_source / ImuSource / 报警旁路 / 缺席降级 / 读 200
+duck-control/src/imu.rs        BusImu、SflpDecoder 抽出、StaleImuTracker 挪进来共用
+duck-control/src/bus.rs        纯搬家（改用共用的 StaleImuTracker）
+duck-control/src/lib.rs        导出 ImuSource / ImuSourceKind
+robotd/src/main.rs             native_imu 类型换成 ImuSource
+robotd/src/imu_only.rs         bus 模式下 imu: 模式明确报错，不装作能读
+scripts/configure.py           生成的 config 里加 imu_source='i2c'
+```
+
+测试：`cargo test -p duck-control` **139 通过 0 失败**；`robotd` **145 通过 + 3 ignored**，集成 **7 通过**。
+
+**全程没 commit、没 push。** `radxa/installation.json` 没动，板上 `/root` 没动，`allow_motion` 全程 false，没写 EEPROM、没开过扭矩。

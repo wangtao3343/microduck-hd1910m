@@ -4,8 +4,9 @@
 //! rustypot 1.6's V1 parser discards status errors, so this small transport
 //! validates both the packet alarm and register 65 instead of hiding faults.
 use crate::bno08x::Bno08x;
-use crate::io::{IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
-use crate::model::{JOINT_NAMES, NUM_JOINTS};
+use crate::imu::{BusImu, IMU_BLOCK_LEN, ImuData, STALE_RUN_WARN, SflpDecoder};
+use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
+use crate::model::{IMU_DXL_ID, JOINT_NAMES, NUM_JOINTS};
 use serde::{Deserialize, Serialize};
 use serialport::SerialPort;
 use std::fs;
@@ -34,6 +35,10 @@ pub struct Config {
     pub installation: String,
     pub imu_bus: String,
     pub imu_address: u16,
+    /// IMU 从哪儿来。默认 I²C（BNO085），跟以前完全一样；这块板子上没有那颗芯片，
+    /// 所以真正的来源是舵机总线上的 ID 200。
+    #[serde(default)]
+    pub imu_source: ImuSourceKind,
     #[serde(default)]
     pub allow_motion: bool,
     #[serde(default)]
@@ -44,6 +49,18 @@ pub struct Config {
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServoGainProfile { ReferenceRuntime }
+
+/// IMU 的字节从哪条线来。
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImuSourceKind {
+    /// 独立 I²C 总线上的 BNO085 —— 就是下面 `imu_bus` / `imu_address` 指的器件。
+    #[default]
+    I2c,
+    /// 冒充 200 号舵机的 `imu_to_dxl` 小板，跟关节同一条 `sync_read` 读回来。
+    /// 这是官方那台机器人的形状，也是这块板子上真实存在的那个 IMU。
+    Bus,
+}
 
 impl ServoGainProfile {
     fn rows(self, joints: &[Joint]) -> Vec<Vec<u8>> {
@@ -99,6 +116,108 @@ fn load_config(path: &str) -> Result<(Config, Installation)> {
     Ok((cfg, installation))
 }
 
+/// 本后端上报的那个 IMU，不管它是从哪条线来的。
+///
+/// 两条臂都是共享句柄：`robotd` 手上握着一个，用来在控制循环还起不来的时候先把姿态发
+/// 出去；反馈线程握着同一个。总线那条用的是互斥锁而不是通道，因为块是由**本来就持有
+/// 串口的那条线程**解码的 —— 没有第二个读者需要喂。
+#[derive(Clone)]
+pub enum ImuSource {
+    Bno(std::sync::Arc<Bno08x>),
+    Bus(std::sync::Arc<std::sync::Mutex<BusImu>>),
+}
+
+impl ImuSource {
+    pub fn read(&self) -> Result<ImuData> {
+        match self {
+            Self::Bno(imu) => imu.read(),
+            Self::Bus(imu) => imu.lock().map_err(err)?.read(),
+        }
+    }
+
+    pub fn snapshot(&self) -> Result<(ImuData, Instant)> {
+        match self {
+            Self::Bno(imu) => imu.snapshot(),
+            Self::Bus(imu) => imu.lock().map_err(err)?.snapshot(),
+        }
+    }
+
+    /// 不会失败。`feedback()` 原来这里是 `.ok()?` —— IMU 一打嗝，整份报告变 `None`，
+    /// 位置、关节、错误全跟着没了。读不到的计数器就说自己读不到。
+    pub fn report_stats(&self) -> serde_json::Value {
+        match self {
+            Self::Bno(imu) => imu
+                .report_stats()
+                .unwrap_or_else(|e| serde_json::json!({"source":"i2c","error":e.to_string()})),
+            Self::Bus(imu) => match imu.lock() {
+                Ok(imu) => imu.report_stats(),
+                Err(_) => serde_json::json!({"source":"bus","error":"imu 锁已中毒"}),
+            },
+        }
+    }
+
+    /// 只在操作员显式复位之后调用。
+    pub fn reconnect(&self) -> Result<()> {
+        match self {
+            Self::Bno(imu) => imu.reconnect(),
+            Self::Bus(imu) => {
+                imu.lock().map_err(err)?.reconnect();
+                Ok(())
+            }
+        }
+    }
+
+    pub fn set_reference_filter(&self, enabled: bool) {
+        match self {
+            Self::Bno(imu) => imu.set_reference_filter(enabled),
+            Self::Bus(imu) => {
+                if let Ok(mut imu) = imu.lock() {
+                    imu.set_reference_filter(enabled);
+                }
+            }
+        }
+    }
+
+    pub fn ready(&self) -> bool {
+        match self {
+            Self::Bno(imu) => imu.read().is_ok(),
+            Self::Bus(imu) => imu.lock().is_ok_and(|imu| imu.ready()),
+        }
+    }
+
+    /// I²C 那条路上没有「重复块」这个概念（每次报告自带序号），如实报零。
+    pub fn stale(&self) -> ImuStale {
+        match self {
+            Self::Bno(_) => ImuStale::default(),
+            Self::Bus(imu) => imu.lock().map(|imu| imu.stale()).unwrap_or_default(),
+        }
+    }
+
+    /// 这一轮关节读要不要带上小板。
+    pub fn wants_block(&self, now: Instant) -> bool {
+        match self {
+            Self::Bno(_) => false,
+            Self::Bus(imu) => imu.lock().is_ok_and(|imu| imu.wants_block(now)),
+        }
+    }
+
+    /// 记下关节读捎回来的那个块。I²C 那个臂返回 `None` —— 它的块从不搭舵机总线。
+    pub fn observe_block(&self, block: &[u8; IMU_BLOCK_LEN], now: Instant) -> Option<u64> {
+        match self {
+            Self::Bno(_) => None,
+            Self::Bus(imu) => imu.lock().ok().map(|mut imu| imu.observe(block, now)),
+        }
+    }
+
+    pub fn record_miss(&self, now: Instant, error: &str) {
+        if let Self::Bus(imu) = self
+            && let Ok(mut imu) = imu.lock()
+        {
+            imu.record_miss(now, error);
+        }
+    }
+}
+
 pub struct FeetechIo {
     reference_native: bool,
     filtered_velocity: Option<([f64; NUM_JOINTS], Instant)>,
@@ -106,7 +225,7 @@ pub struct FeetechIo {
     port: serialport::TTYPort,
     pub joints: Vec<Joint>,
     ids: Vec<u8>,
-    imu: std::sync::Arc<Bno08x>,
+    imu: ImuSource,
     limits: Vec<(i32, i32, u8)>,
     allow_motion: bool,
     enabled: bool,
@@ -121,6 +240,12 @@ pub struct FeetechIo {
     scheduled_bus: bool,
     transaction_deadline: Option<Instant>,
     alternate_feedback: bool,
+    /// 上一次超时的那次读里，**小板**是不是缺席的那一个。
+    ///
+    /// [`FeetechIo::sync_read_ids_once`] 每次退出都会把它算准。存成一个布尔字段而不是
+    /// 去解析错误文本，是因为 `missing_ids=[…]` 没法安全地搜 "200" ——
+    /// `received_bytes=200` 会一起命中。
+    imu_silent: bool,
 }
 
 #[derive(Default, Debug, Clone, Serialize)]
@@ -139,7 +264,7 @@ pub struct ThreadedFeetechIo {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
     observation_at: Option<Instant>,
-    imu: std::sync::Arc<Bno08x>,
+    imu: ImuSource,
     scheduled_bus: bool,
 }
 
@@ -200,14 +325,31 @@ impl ThreadedFeetechIo {
     }
 
     /// Keep this owner alive across motor initialization failures: reopening it resets SH-2.
-    pub fn open_imu(path: &str) -> Result<std::sync::Arc<Bno08x>> {
+    pub fn open_imu(path: &str) -> Result<ImuSource> {
         let (cfg, installation) = load_config(path)?;
-        let imu = Bno08x::open(&cfg.imu_bus, cfg.imu_address, installation.imu_mount_wxyz)?;
-        imu.set_reference_filter(cfg.reference_native);
-        Ok(std::sync::Arc::new(imu))
+        match cfg.imu_source {
+            ImuSourceKind::I2c => {
+                let imu =
+                    Bno08x::open(&cfg.imu_bus, cfg.imu_address, installation.imu_mount_wxyz)?;
+                imu.set_reference_filter(cfg.reference_native);
+                Ok(ImuSource::Bno(std::sync::Arc::new(imu)))
+            }
+            // 没什么可打开的：小板在舵机总线上，而那条总线归 `open_with_imu`。文件里的
+            // `imu_bus` / `imu_address` 保留但这里不用 —— `robotd` 的 IMU-only 模式还在读。
+            //
+            // 朝向**不能**用 `installation.imu_mount_wxyz`：那一格是配给 I²C 上那颗 BNO085 的，
+            // 而 200 小板的装法跟它差 90°。鸭子站直时实测反推的重力：官方朝向 `[√0.5,0,√0.5,0]`
+            // 得 [-0.08,-0.01,-1.00]（离正立 4.8°），文件里那份得 [-0.08,-1.00,0.01]（90.4°）
+            // —— 后者等于把「站着」认成「侧躺」，策略看到的重力整个是错的。官方的 `bus.rs`
+            // 读同一块小板也是硬编码这个朝向，这里跟它对齐。两份都是单位四元数，归一化那
+            // 道闸拦不住这种错，只能靠朝向本身对。
+            ImuSourceKind::Bus => Ok(ImuSource::Bus(std::sync::Arc::new(std::sync::Mutex::new(
+                BusImu::new(SflpDecoder::DEFAULT_MOUNT, cfg.reference_native),
+            )))),
+        }
     }
 
-    pub fn open_with_imu(path: &str, imu: std::sync::Arc<Bno08x>) -> Result<Self> {
+    pub fn open_with_imu(path: &str, imu: ImuSource) -> Result<Self> {
         Self::from_io(FeetechIo::open_with_imu(path, imu)?)
     }
 
@@ -446,7 +588,7 @@ impl RobotIo for ThreadedFeetechIo {
         let joint_valid = state.sample.is_some() && at.elapsed() < Duration::from_millis(80) && state.fatal.is_none();
         drop(state);
         value["joint_age_s"] = serde_json::json!(at.elapsed().as_secs_f64());
-        value["imu_transport"] = self.imu.report_stats().ok()?;
+        value["imu_transport"] = self.imu.report_stats();
         let imu = self.imu.snapshot();
         value["imu_valid"] = serde_json::json!(imu.is_ok());
         value["control_valid"] = serde_json::json!(self.observation_at.is_some() && joint_valid && imu.is_ok());
@@ -565,7 +707,11 @@ impl RobotIo for ThreadedFeetechIo {
     }
 
     fn imu_ready(&self) -> bool {
-        self.imu.read().is_ok() && self.feedback.0.lock().unwrap().sample.is_some()
+        self.imu.ready() && self.feedback.0.lock().unwrap().sample.is_some()
+    }
+
+    fn imu_stale(&self) -> ImuStale {
+        self.imu.stale()
     }
 }
 
@@ -659,7 +805,7 @@ impl FeetechIo {
         Self::open_with_imu(config_path, imu)
     }
 
-    fn open_with_imu(config_path: &str, imu: std::sync::Arc<Bno08x>) -> Result<Self> {
+    fn open_with_imu(config_path: &str, imu: ImuSource) -> Result<Self> {
         let (cfg, installation) = load_config(config_path)?;
         let native = open_serial(&cfg.port)?;
         let ids = installation.joints.iter().map(|j| j.id).collect();
@@ -685,6 +831,7 @@ impl FeetechIo {
             scheduled_bus: cfg.scheduled_bus,
             transaction_deadline: None,
             alternate_feedback: false,
+            imu_silent: false,
         };
         let config = io.sync_read(0, 40)?;
         for (id, row) in io.ids.iter().zip(config) {
@@ -764,13 +911,37 @@ impl FeetechIo {
         }
     }
 
-    fn sync_read_once(&mut self, address: u8, size: u8) -> Result<Vec<Vec<u8>>> {
+    /// 这一轮关节读要问的 id：舵机，外加（需要的话）IMU 小板。
+    ///
+    /// **小板排最后是故意的。** 它收到指令帧后等自己固定的 `T_resp = 50 µs` 才开口
+    /// （21 字节 = 210 µs），而飞特舵机的自然应答延时**比 50 µs 还短** —— 小板排队首时，
+    /// 舵机在小板还在驱动总线的时候就开答，半双工单线上两个器件同时驱动，字节互相冲掉：
+    /// 台架实测每轮固定坏两帧（小板自己的校验错 + 紧跟它的那颗舵机）。排最后的实测结果
+    /// 是 16 帧 336 B 全过，只多 210 µs。依据见 `tools/下游改动.md` 改动 C。
+    ///
+    /// 注意这**不是**第二条事务：还是同一条 `sync_read`，只是 id 表长了一格。
+    fn read_ids(&self, now: Instant) -> Vec<u8> {
+        let mut ids = self.ids.clone();
+        if self.imu.wants_block(now) {
+            ids.push(IMU_DXL_ID);
+        }
+        ids
+    }
+
+    /// 同一个读，但 id 表由调用方给。
+    ///
+    /// 只有 tick 的那次反馈读会往里塞 200；其余调用点传的都是 [`FeetechIo::ids`]，
+    /// 行为一个字没变。
+    fn sync_read_ids_once(&mut self, ids: &[u8], address: u8, size: u8) -> Result<Vec<Vec<u8>>> {
+        // 先清空：这个字段说的是**这一次**尝试的结果。下面每一个 `return` 之前都会重算
+        // 它，但发不出去（`send` 失败）时根本没人被问过，那时的正确答案是「不是小板」。
+        self.imu_silent = false;
         let mut params = vec![address, size];
-        params.extend(&self.ids);
+        params.extend(ids);
         self.send(254, 0x82, &params)?;
         let started = Instant::now();
         let deadline = self.transaction_deadline.unwrap_or(started + Duration::from_millis(30));
-        let mut rows = vec![None; self.ids.len()];
+        let mut rows = vec![None; ids.len()];
         let mut packet_error: Option<IoError> = None;
         let mut bytes = Vec::new();
         let mut received = 0;
@@ -782,7 +953,7 @@ impl FeetechIo {
                 let id = bytes[2];
                 if bytes[..2] != [255, 255]
                     || bytes[3] as usize != size as usize + 2
-                    || !self.ids.contains(&id)
+                    || !ids.contains(&id)
                 {
                     bytes.remove(0);
                     discarded += 1;
@@ -799,7 +970,12 @@ impl FeetechIo {
                 }
                 let row = bytes[5..packet_len - 1].to_vec();
                 let mut alarm = result.err();
-                if address <= 65
+                // 寄存器 65 是舵机状态帧里的报警字节。小板那一行不是舵机：本次读用的三种
+                // 帧形下（(56,15)→row[9]、(55,16)→row[10]、(40,31)→row[25]），这个偏移
+                // 落在四元数 y 的高字节上 —— 一块完全健康的小板，会在大约一半的朝向上
+                // 被报成报警。
+                if id != IMU_DXL_ID
+                    && address <= 65
                     && address as usize + size as usize > 65
                     && row[65 - address as usize] != 0
                 {
@@ -817,19 +993,22 @@ impl FeetechIo {
                         packet_error = Some(error);
                     }
                 }
-                let index = self.ids.iter().position(|v| *v == id).unwrap();
+                let index = ids.iter().position(|v| *v == id).unwrap();
                 rows[index] = Some(row);
                 bytes.drain(..packet_len);
             }
-            if rows.iter().all(Option::is_some) {
-                break;
-            }
-            let missing: Vec<u8> = self
-                .ids
+            let missing: Vec<u8> = ids
                 .iter()
                 .zip(&rows)
                 .filter_map(|(id, row)| row.is_none().then_some(*id))
                 .collect();
+            // 每次走到这里都重算，所以下面**每一个** return 处这个字段都是准的。
+            // 调用方需要知道「安静下去的是不是小板」：它是唯一一个可以下一轮就不问的 id，
+            // 而下面那条消息是给人看的散文。
+            self.imu_silent = missing.contains(&IMU_DXL_ID);
+            if missing.is_empty() {
+                break;
+            }
             let timeout = || {
                 IoError::IncompleteFeedback(format!(
                     "sync-read addr={address} size={size} missing_ids={missing:?} received_bytes={received} discarded_bytes={discarded} tail={bytes:02x?} elapsed_ms={:.3}",
@@ -864,10 +1043,15 @@ impl FeetechIo {
     }
 
     fn sync_read(&mut self, address: u8, size: u8) -> Result<Vec<Vec<u8>>> {
-        if self.transaction_deadline.is_some() { return self.sync_read_once(address, size); }
+        let ids = self.ids.clone();
+        self.sync_read_ids(&ids, address, size)
+    }
+
+    fn sync_read_ids(&mut self, ids: &[u8], address: u8, size: u8) -> Result<Vec<Vec<u8>>> {
+        if self.transaction_deadline.is_some() { return self.sync_read_ids_once(ids, address, size); }
         // Retry only the confirmed angle-sensor alarm, never replay motor writes.
         for attempt in 0..=5 {
-            match self.sync_read_once(address, size) {
+            match self.sync_read_ids_once(ids, address, size) {
                 Err(e) if attempt < 5 && e.to_string().ends_with("alarm 0x02") => continue,
                 result => return result,
             }
@@ -920,7 +1104,9 @@ impl FeetechIo {
         };
         if scheduled { self.alternate_feedback = !self.alternate_feedback; }
         let mut enable_offset = 0;
-        let rows = match self.sync_read(address, size) {
+        let ids = self.read_ids(Instant::now());
+        let board_requested = ids.len() > self.ids.len();
+        let read = match self.sync_read_ids(&ids, address, size) {
             Err(error @ IoError::IncompleteFeedback(_)) if check_enable && !scheduled => {
                 self.recovery.attempts += 1;
                 self.recovery.last_error = Some(error.to_string());
@@ -928,15 +1114,26 @@ impl FeetechIo {
                 // No writes or stale observations during recovery. Read an extra
                 // preceding register so late original packets fail length checks.
                 std::thread::sleep(Duration::from_millis(2));
-                let result = self.sync_read_once(address - 1, size + 1);
+                let result = self.sync_read_ids_once(&ids, address - 1, size + 1);
                 self.recovery.last_elapsed_ms = retry_start.elapsed().as_secs_f64() * 1000.;
                 offset += 1;
                 enable_offset = 1;
-                result?
+                result
             }
-            result => result?,
+            result => result,
         };
-        if combined && rows.iter().any(|row| row[enable_offset] != 1) {
+        let rows = match read {
+            Ok(rows) => rows,
+            Err(error) => {
+                // 问了小板、它没答，才记一次缺席 —— 判据用的是结构化下来的 `imu_silent`
+                // （缺席名单里有没有 200），不是去猜错误文本。舵机自己掉了不该算在小板头上。
+                if board_requested && self.imu_silent {
+                    self.imu.record_miss(Instant::now(), &error.to_string());
+                }
+                return Err(error);
+            }
+        };
+        if combined && rows.iter().take(NUM_JOINTS).any(|row| row[enable_offset] != 1) {
             self.enabled = false;
             return Err(err("enable feedback lost; explicit re-init required"));
         }
@@ -966,6 +1163,25 @@ impl FeetechIo {
                 "voltage_v":row[6] as f64/10.,"temperature_c":row[7],"status":row[9],
                 "current_a":signed([row[13],row[14]]) as f64*0.0065,
                 "torque_enabled":if self.enabled { Some(1) } else { None::<u8> }}));
+        }
+        // 小板的块搭的是舵机那一段窗口：固件把它那 12 字节 memcpy 到被问到的任意窗口里，
+        // 所以三种帧形下它都落在舵机自己那 15 字节的同一个绝对地址上 —— 也就是同一个
+        // `offset`，白捡的，不用为它单独算偏移。
+        if let Some(row) = rows.get(NUM_JOINTS) {
+            let mut block = [0u8; IMU_BLOCK_LEN];
+            block.copy_from_slice(&row[offset..offset + IMU_BLOCK_LEN]);
+            let run = self.imu.observe_block(&block, Instant::now());
+            // 说出来，否则这些计数器就是没人看的数字 —— 但要等这段连续重复长到有意义
+            // 再说。再往后限流，因为一块停止刷新的小板每一轮都会产出一样的一行，
+            // 50 Hz 的相同警告会把 journal 冲垮。
+            if let Some(run) = run
+                && (run == STALE_RUN_WARN || (run > STALE_RUN_WARN && run.is_multiple_of(500)))
+            {
+                tracing::warn!(
+                    consecutive = run,
+                    "总线 IMU 连着 {run} 次读回来是同一个样本 —— 姿态已经冻住了"
+                );
+            }
         }
         if self.reference_native {
             let now = Instant::now();
@@ -1103,13 +1319,18 @@ impl RobotIo for FeetechIo {
         self.slow.ok_or_else(|| err("no motor sample"))
     }
     fn imu_ready(&self) -> bool {
-        self.imu.read().is_ok()
+        self.imu.ready()
+    }
+    fn imu_stale(&self) -> ImuStale {
+        self.imu.stale()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::imu::{IMU_MISS_LIMIT, IMU_RETRY_INTERVAL};
 
     fn scheduled_peer(mut peer: serialport::TTYPort,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1225,7 +1446,10 @@ mod tests {
     }
     #[test]
     fn motor_initialization_failure_keeps_the_same_imu_owner() {
-        let imu = std::sync::Arc::new(Bno08x::fixture());
+        let bno = std::sync::Arc::new(Bno08x::fixture());
+        let imu = ImuSource::Bno(bno.clone());
+        // `imu` 自己握着这份 BNO 的一份引用，所以基线不是 1 —— 要看的是它**没有变**。
+        let owners = std::sync::Arc::strong_count(&bno);
         let dir = std::env::temp_dir().join(format!("feetech-imu-owner-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("installation.json"), include_str!("../../../radxa/installation.json")).unwrap();
@@ -1238,8 +1462,8 @@ mod tests {
             let error = result.err().unwrap().to_string();
             assert!(error.contains("Feetech:"), "{error}");
             assert!(!error.contains("BNO085"), "must not reopen the missing IMU bus: {error}");
-            assert_eq!(std::sync::Arc::strong_count(&imu), 1);
-            assert_eq!(imu.report_stats().unwrap()["reconnects"], 0);
+            assert_eq!(std::sync::Arc::strong_count(&bno), owners, "a failed open must not retain the IMU");
+            assert_eq!(bno.report_stats().unwrap()["reconnects"], 0);
         }
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1247,7 +1471,7 @@ mod tests {
     fn missing_imu_does_not_block_joint_feedback_or_allow_control() {
         use serialport::SerialPort;
         let (mut bus, mut peer) = fixture();
-        bus.imu = std::sync::Arc::new(crate::bno08x::Bno08x::fixture_unavailable());
+        bus.imu = ImuSource::Bno(std::sync::Arc::new(crate::bno08x::Bno08x::fixture_unavailable()));
         let ids = bus.ids.clone();
         let server = std::thread::spawn(move || {
             respond(&mut peer, &ids, 0);
@@ -1398,7 +1622,7 @@ mod tests {
                 port: client,
                 ids: cfg.joints.iter().map(|j| j.id).collect(),
                 joints: cfg.joints,
-                imu: std::sync::Arc::new(Bno08x::fixture()),
+                imu: ImuSource::Bno(std::sync::Arc::new(Bno08x::fixture())),
                 limits: vec![(0, 4095, 80); 15],
                 allow_motion: false,
                 enabled: true,
@@ -1413,6 +1637,7 @@ mod tests {
                 scheduled_bus: false,
                 transaction_deadline: None,
                 alternate_feedback: false,
+                imu_silent: false,
             },
             server,
         )
@@ -1468,6 +1693,450 @@ mod tests {
             params.extend(value);
         }
         expect(port, &instruction(254, 0x83, &params).unwrap());
+    }
+
+    // ---- 总线 IMU 那套对端工具 ----
+
+    fn installation() -> Installation {
+        serde_json::from_str(include_str!("../../../radxa/installation.json")).unwrap()
+    }
+
+    /// 跟 `fixture()` 一样，但 IMU 走舵机总线 —— 也就是这次改动要考的那条路。
+    ///
+    /// `fixture()` 本身故意留在 I²C 上：十几个脚本化的对端都是按「一次读、16 个包」
+    /// 写死的，给它多塞一格请求会把它们全卡死。
+    fn bus_fixture() -> (FeetechIo, serialport::TTYPort) {
+        let (mut io, peer) = fixture();
+        // 跟 `open_imu` 的 bus 臂逐字一致：那里也是这个朝向，不是安装文件里那一格。
+        io.imu = ImuSource::Bus(std::sync::Arc::new(std::sync::Mutex::new(BusImu::new(
+            SflpDecoder::DEFAULT_MOUNT,
+            false,
+        ))));
+        (io, peer)
+    }
+
+    /// 一个 SFLP 已经开始写表的块：四元数 x 放进 `quat_x`，其余全零（= gyro 零、y/z 零）。
+    fn imu_block(quat_x: u16) -> [u8; IMU_BLOCK_LEN] {
+        let mut block = [0u8; IMU_BLOCK_LEN];
+        block[6..8].copy_from_slice(&quat_x.to_le_bytes());
+        block
+    }
+
+    /// 舵机那 15 字节状态块，跟 `respond()` 里那份逐字一致。
+    fn servo_row() -> [u8; 15] {
+        let mut row = [0u8; 15];
+        row[1] = 8;
+        row[2] = 1;
+        row[3] = 128;
+        row[6] = 74;
+        row[7] = 30;
+        row[13] = 2;
+        row[14] = 128;
+        row
+    }
+
+    fn send_row(port: &mut serialport::TTYPort, id: u8, alarm: u8, raw: &[u8]) {
+        let mut packet = vec![255, 255, id, (raw.len() + 2) as u8, alarm];
+        packet.extend(raw);
+        packet.push(checksum(&packet[2..]));
+        port.write_all(&packet).unwrap();
+    }
+
+    /// 读一次请求，返回 `(address, size, 被问到的 id 表)`。
+    fn read_request(port: &mut serialport::TTYPort) -> std::io::Result<(u8, u8, Vec<u8>)> {
+        let mut header = [0u8; 4];
+        port.read_exact(&mut header)?;
+        assert_eq!(&header[..2], &[255, 255]);
+        assert_eq!(header[2], 254, "expected a broadcast instruction");
+        let mut body = vec![0u8; header[3] as usize];
+        port.read_exact(&mut body)?;
+        assert_eq!(body[0], 0x82, "expected a sync_read");
+        Ok((body[1], body[2], body[3..body.len() - 1].to_vec()))
+    }
+
+    /// 按帧形把内容摆到正确的偏移上，逐条应答。
+    ///
+    /// `address`/`size` 是这次读问的窗口。舵机的 15 字节状态块和 IMU 的 12 字节块都固定
+    /// 从**绝对地址 56** 开始（固件就是把小块 memcpy 进被问到的任意窗口里），所以两者在
+    /// 窗口内的偏移都是 `56 - address`。这里照抄固件的做法，好让偏移算错的时候测试会红。
+    ///
+    /// `with_board = false` 表示小板不吭声，只答舵机。
+    fn answer(
+        port: &mut serialport::TTYPort,
+        address: u8,
+        size: u8,
+        ids: &[u8],
+        alarm: u8,
+        block: [u8; IMU_BLOCK_LEN],
+        with_board: bool,
+    ) {
+        let off = (56 - address) as usize;
+        for id in ids {
+            if !with_board && *id == IMU_DXL_ID {
+                continue;
+            }
+            let mut raw = vec![0u8; size as usize];
+            if *id == IMU_DXL_ID {
+                raw[off..off + IMU_BLOCK_LEN].copy_from_slice(&block);
+            } else {
+                raw[off..off + 15].copy_from_slice(&servo_row());
+            }
+            send_row(port, *id, alarm, &raw);
+        }
+    }
+
+    /// 一次「读请求 → 应答」，地址和 id 表都从请求里读出来。超时返回 `Err`。
+    fn serve_once(
+        port: &mut serialport::TTYPort,
+        block: [u8; IMU_BLOCK_LEN],
+        with_board: bool,
+    ) -> std::io::Result<Vec<u8>> {
+        let (address, size, asked) = read_request(port)?;
+        answer(port, address, size, &asked, 0, block, with_board);
+        Ok(asked)
+    }
+
+    // ---- 总线 IMU 的测试 ----
+
+    /// 目标形状：小板跟舵机在**同一条** `sync_read` 里，而且排在**最后**。
+    ///
+    /// 顺序不是风格问题 —— 小板应答延时比飞特舵机长，排队首会让两者同时驱动半双工
+    /// 总线，每轮固定坏两帧。见 `tools/下游改动.md` 改动 C。
+    #[test]
+    fn the_imu_board_rides_the_joint_read_and_is_asked_last() {
+        let (mut io, mut peer) = bus_fixture();
+        let ids = io.ids.clone();
+        let mut asked = ids.clone();
+        asked.push(IMU_DXL_ID);
+        assert_eq!(asked.last(), Some(&IMU_DXL_ID));
+        let server = std::thread::spawn(move || {
+            // `read_request` 会把实际收到的 id 表原样交回来，所以下面比的就是线上字节。
+            // 对端随线程一起交回来，不能答完就 drop：主线程那头还在读，先关从端会让它
+            // 读到 EPIPE（跟别的 PTY 测试一样，`peer` 是线程的返回值）。
+            (serve_once(&mut peer, imu_block(0x3000), true).unwrap(), peer)
+        });
+        let sensors = io.read().unwrap();
+        let (on_the_wire, _peer) = server.join().unwrap();
+        assert_eq!(on_the_wire, asked, "小板必须排在 id 表最后");
+        assert_ne!(
+            sensors.imu.quat,
+            [1.0, 0.0, 0.0, 0.0],
+            "舵机读捎回来的块必须被解成姿态"
+        );
+    }
+
+    /// 寄存器 65 那条报警规则只对舵机成立。
+    ///
+    /// 本次读的三种帧形下，`65 - address` 都落在四元数 y 的高字节上 —— 一块完全健康的
+    /// 小板，会在大约一半的朝向上被报成报警。这个测试就是那条守卫：把那一格填成非零，
+    /// 读必须照样成功。
+    #[test]
+    fn a_healthy_imu_block_cannot_be_mistaken_for_a_register_65_alarm() {
+        let (mut io, mut peer) = bus_fixture();
+        let mut block = imu_block(0x3000);
+        block[9] = 0x30; // 四元数 y = 0.125，高字节非零
+        assert_ne!(block[65 - 56], 0, "前提：这一格正好落在寄存器 65 上");
+        let server = std::thread::spawn(move || {
+            (serve_once(&mut peer, block, true).unwrap(), peer)
+        });
+        let sensors = io.read().expect("健康的小板不该被当成报警");
+        server.join().unwrap();
+        assert!(sensors.imu.quat[1].abs() > 0.0 || sensors.imu.quat[2].abs() > 0.0);
+    }
+
+    /// 小板不吭声，不能把舵机反馈拖下水。
+    ///
+    /// `sync_read` 要等 id 表里每一个都答完才返回，所以一块死掉的小板会让**每一轮**都
+    /// 白等一个超时，还顺手把关节读数一起判失败。连续缺席够多次之后必须把它摘掉，
+    /// 而且**永远不许**变成电机故障（`latch_motor_fault` 只放过 `ImuUnavailable`）。
+    #[test]
+    fn a_silent_imu_board_is_dropped_so_joint_feedback_keeps_flowing() {
+        let (io, mut peer) = bus_fixture();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = stop.clone();
+        let server = std::thread::spawn(move || {
+            peer.set_timeout(Duration::from_millis(200)).unwrap();
+            let mut asks: Vec<Vec<u8>> = Vec::new();
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                let Ok(asked) = serve_once(&mut peer, imu_block(0x3000), false) else { break };
+                asks.push(asked);
+            }
+            asks
+        });
+        let mut io = ThreadedFeetechIo::from_io(io).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while io.feedback_stats().complete_reads == 0 {
+            assert!(Instant::now() < deadline, "小板不吭声，舵机反馈就再也起不来了");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(io.feedback_stats().failed_reads >= u64::from(IMU_MISS_LIMIT));
+        // 这一条同时钉住「没锁电机故障」：一旦锁了，read() 会先返回那个 fatal。
+        assert!(
+            matches!(io.read().unwrap_err(), IoError::ImuUnavailable(_)),
+            "IMU 缺席只能是 IMU 的事"
+        );
+        let value = io.feedback().unwrap();
+        assert_eq!(value["imu_valid"], false);
+        assert_eq!(value["imu_transport"]["dropped"], true);
+        assert!(value["imu_transport"]["misses"].as_u64().unwrap() >= u64::from(IMU_MISS_LIMIT));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let asks = server.join().unwrap();
+        assert!(asks[0].contains(&IMU_DXL_ID), "第一轮必须先问过小板");
+        assert!(
+            !asks.last().unwrap().contains(&IMU_DXL_ID),
+            "摘掉之后就不该再问它"
+        );
+    }
+
+    /// 摘掉之后隔一段再放一轮进去试探，试探失败就重新计时。
+    #[test]
+    fn a_dropped_imu_board_is_re_probed_on_the_retry_interval() {
+        let now = Instant::now();
+        let mut imu = BusImu::new([1.0, 0.0, 0.0, 0.0], false);
+        assert!(imu.wants_block(now));
+        for _ in 0..IMU_MISS_LIMIT {
+            imu.record_miss(now, "silent");
+        }
+        assert!(!imu.wants_block(now), "刚到上限就该停");
+        assert!(!imu.wants_block(now + IMU_RETRY_INTERVAL - Duration::from_millis(1)));
+        assert!(imu.wants_block(now + IMU_RETRY_INTERVAL), "到点要试探一次");
+        // 试探也没答：计时从这次重新算，不是从摘掉那次。
+        imu.record_miss(now + IMU_RETRY_INTERVAL, "silent");
+        assert!(!imu.wants_block(now + IMU_RETRY_INTERVAL + Duration::from_millis(1)));
+        // 答了：立刻恢复，并且记一次重连。
+        assert_eq!(imu.observe(&imu_block(0x3000), now), 0);
+        assert!(imu.wants_block(now));
+        assert_eq!(imu.report_stats()["reconnects"], 1);
+        assert_eq!(imu.report_stats()["dropped"], false);
+    }
+
+    /// 小板不额外开一次读：它搭的还是关节那一帧，帧形一个字不改。
+    ///
+    /// 这条同时守住 `transaction_deadline` —— 排程总线靠它选帧形，`send()` 看到它是
+    /// `Some` 就走 3 ms 的目标写预算。多一条事务就会把这两处一起弄坏。
+    #[test]
+    fn the_board_shares_the_joint_frame_instead_of_getting_one_of_its_own() {
+        let (mut io, mut peer) = bus_fixture();
+        let ids = io.ids.clone();
+        let server = std::thread::spawn(move || {
+            let mut frames = Vec::new();
+            for _ in 0..2 {
+                let (address, size, asked) = read_request(&mut peer).unwrap();
+                frames.push((address, size));
+                // 对端照客户端选的窗口摆内容，包括小板的块该落在第几个字节。
+                answer(&mut peer, address, size, &asked, 0, imu_block(0x3000), true);
+                assert_eq!(asked.last(), Some(&IMU_DXL_ID));
+            }
+            // 对端随线程交回来，主线程那头还在读：先关从端会让它读到 EPIPE。
+            (frames, peer)
+        });
+        // `scheduled_bus` 的每一轮都自带一个读预算，帧形在 (56,15) 和 (55,16) 之间交替。
+        for _ in 0..2 {
+            io.transaction_deadline = Some(Instant::now() + SCHEDULED_READ_BUDGET);
+            io.motor_feedback().unwrap();
+            io.transaction_deadline = None;
+        }
+        let (frames, _peer) = server.join().unwrap();
+        assert_eq!(frames, vec![(56, 15), (55, 16)], "帧形必须还是排程那两种");
+        assert_eq!(ids.len(), NUM_JOINTS);
+    }
+
+    /// 两条总线必须用同一把尺子量「小板在重复自己」。
+    ///
+    /// 这正是 `StaleImuTracker` 从 `bus.rs` 搬进 `imu.rs` 的原因：拿同样的块喂两边，
+    /// 连总数带当前连续数都得逐次相等。哪天有人在一边改了判法，这条会红。
+    #[test]
+    fn a_board_that_repeats_itself_is_counted_the_same_way_on_both_buses() {
+        let now = Instant::now();
+        let repeat = imu_block(0x3000);
+        let other = imu_block(0x3100);
+        let tail = imu_block(0x3200);
+        let mut bus_imu = BusImu::new([1.0, 0.0, 0.0, 0.0], false);
+        let mut dynamixel = crate::imu::StaleImuTracker::default();
+        let mut peak = 0;
+        for i in 0..STALE_RUN_WARN + 10 {
+            // 头一个块是基线（不算重复），中间一段连着同一个块，最后再换新的。
+            let block = if i == 0 { other } else if i > STALE_RUN_WARN + 3 { tail } else { repeat };
+            let run = bus_imu.observe(&block, now);
+            assert_eq!(run, dynamixel.observe(&block), "第 {i} 次读");
+            peak = peak.max(run);
+        }
+        assert_eq!(bus_imu.stale(), dynamixel.stale);
+        assert!(
+            peak >= STALE_RUN_WARN,
+            "重复段必须爬过警报线，否则这条测试什么也没考到"
+        );
+        // 换一个新样本：run 归零，总数留着 —— 两边同时。
+        let total = bus_imu.stale().total;
+        assert!(total > 0);
+        assert_eq!(bus_imu.observe(&other, now), dynamixel.observe(&other));
+        assert_eq!(bus_imu.stale(), dynamixel.stale);
+        assert_eq!(bus_imu.stale().run, 0);
+        assert_eq!(bus_imu.stale().total, total);
+    }
+
+    /// mount 来自 `installation.json`，而且先归一化。
+    ///
+    /// `SflpDecoder::new` 不校验 mount，所以一个不是单位四元数的值会悄悄把策略看到的
+    /// 每一个重力向量都缩放一遍 —— 校验不过就得退回小板默认朝向。
+    #[test]
+    fn the_bus_imu_mount_is_normalised_or_refused() {
+        let now = Instant::now();
+        let block = imu_block(0x3000);
+        let mut upright = BusImu::new([1.0, 0.0, 0.0, 0.0], false);
+        let mut quarter_turn = BusImu::new(crate::imu::SflpDecoder::DEFAULT_MOUNT, false);
+        // 重力过了个三点中值，喂一个样本只能看见中值的初值（恒等于「正立」）。
+        for _ in 0..5 {
+            upright.observe(&block, now);
+            quarter_turn.observe(&block, now);
+        }
+        assert_ne!(
+            upright.read().unwrap().gravity,
+            quarter_turn.read().unwrap().gravity,
+            "两个朝向不同的 mount 必须解出不同的重力"
+        );
+        // norm = 2，不在 0.9..=1.1 里 → 退回默认，而不是把重力放大一倍。
+        let mut refused = BusImu::new([2.0, 0.0, 0.0, 0.0], false);
+        for _ in 0..5 {
+            refused.observe(&block, now);
+        }
+        assert_eq!(
+            refused.read().unwrap().gravity,
+            quarter_turn.read().unwrap().gravity
+        );
+    }
+
+    /// 老配置文件（没有 `imu_source` 这一格）必须还是 I²C。
+    ///
+    /// 这条是给「BNO085 还能不能用」这个问题的答案钉的钉子：默认值不变，加这一格是
+    /// 纯增量。
+    #[test]
+    fn an_absent_imu_source_key_still_means_i2c() {
+        let base = serde_json::json!({
+            "port": "/dev/null", "installation": "i.json",
+            "imu_bus": "/dev/i2c-4", "imu_address": 75
+        });
+        let cfg: Config = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(cfg.imu_source, ImuSourceKind::I2c, "缺省必须是 I²C");
+
+        // `scripts/configure.py` 生成的就是这一格，拼写必须对得上。
+        let mut explicit = base.clone();
+        explicit["imu_source"] = serde_json::json!("i2c");
+        let cfg: Config = serde_json::from_value(explicit).unwrap();
+        assert_eq!(cfg.imu_source, ImuSourceKind::I2c);
+
+        let mut bus = base;
+        bus["imu_source"] = serde_json::json!("bus");
+        let cfg: Config = serde_json::from_value(bus).unwrap();
+        assert_eq!(cfg.imu_source, ImuSourceKind::Bus);
+    }
+
+    /// `bus` 模式下 `open_imu` **不该碰 I²C** —— 文件里那个 `imu_bus` 指向一个根本不
+    /// 存在的器件，能开起来就说明那条路没走。
+    #[test]
+    fn a_bus_source_config_opens_without_touching_i2c() {
+        let dir = std::env::temp_dir().join(format!("feetech-bus-imu-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("installation.json"), include_str!("../../../radxa/installation.json"))
+            .unwrap();
+        fs::write(dir.join("config.json"), serde_json::to_vec(&serde_json::json!({
+            "port": "/missing-servo-test", "installation": "installation.json",
+            "imu_bus": "/dev/i2c-does-not-exist", "imu_address": 75,
+            "allow_motion": false, "imu_source": "bus"
+        })).unwrap()).unwrap();
+        let imu = ThreadedFeetechIo::open_imu(dir.join("config.json").to_str().unwrap()).unwrap();
+        assert!(matches!(imu, ImuSource::Bus(_)));
+        // 还没有任何人喂它 —— 诚实地报错，而不是编一个默认姿态出来。
+        assert!(imu.read().is_err());
+        assert!(!imu.ready());
+        assert_eq!(imu.report_stats()["source"], "bus");
+        assert_eq!(imu.report_stats()["dropped"], false);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// **bus 那条臂用的朝向是小板自己的，不是安装文件里那一格。**
+    ///
+    /// 这是上板实测打出来的钉子：鸭子用 servo-web 站起来之后，拿同一次读回的四元数反推重力，
+    /// 官方朝向 `[√0.5,0,√0.5,0]` 得 [-0.08,-0.01,-1.00]（离正立 4.8°），安装文件里那份
+    /// `[0.5,-0.5,0.5,-0.5]` 得 [-0.08,-1.00,0.01]（90.4°）—— 后者等于把「站着」认成「侧躺」，
+    /// 策略拿到手的重力整个是错的。
+    ///
+    /// 两个都是单位四元数，`BusImu::new` 的归一化闸拦不住这种错，只能靠这条测试钉住。
+    /// 安装文件里那一格是配给 I²C 上那颗 BNO085 的（`Bno08x::open` 才是它的读者），
+    /// 而官方读**同一块 200 小板**的 `bus.rs` 也是硬编码这个朝向。
+    #[test]
+    fn the_bus_arm_uses_the_boards_own_mount_not_the_installations() {
+        let dir = std::env::temp_dir().join(format!("feetech-bus-mount-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("installation.json"), include_str!("../../../radxa/installation.json"))
+            .unwrap();
+        fs::write(dir.join("config.json"), serde_json::to_vec(&serde_json::json!({
+            "port": "/missing-servo-test", "installation": "installation.json",
+            "imu_bus": "/dev/i2c-does-not-exist", "imu_address": 75,
+            "allow_motion": false, "imu_source": "bus"
+        })).unwrap()).unwrap();
+        let imu = ThreadedFeetechIo::open_imu(dir.join("config.json").to_str().unwrap()).unwrap();
+        let ImuSource::Bus(opened) = imu else { panic!("imu_source=bus 必须开出 bus 臂") };
+
+        let block = imu_block(0x3000);
+        let now = Instant::now();
+        // 重力过了个三点中值，喂一个样本只能看见中值的初值 —— 两份都喂满 5 个再比。
+        for _ in 0..5 {
+            opened.lock().unwrap().observe(&block, now);
+        }
+        let opened = opened.lock().unwrap().read().unwrap().gravity;
+
+        let mut board = BusImu::new(SflpDecoder::DEFAULT_MOUNT, false);
+        let mut from_file = BusImu::new(installation().imu_mount_wxyz, false);
+        for _ in 0..5 {
+            board.observe(&block, now);
+            from_file.observe(&block, now);
+        }
+        assert_eq!(opened, board.read().unwrap().gravity, "bus 臂跟官方 bus.rs 用同一个朝向");
+        assert_ne!(
+            opened,
+            from_file.read().unwrap().gravity,
+            "安装文件里那一格不是 200 小板的朝向，用它解出来的是侧躺"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `feedback()` 里 `imu_transport` 从来不是 `None` 的原因。
+    ///
+    /// 原来那行是 `self.imu.report_stats().ok()?` —— IMU 一打嗝，整份反馈变 `None`，
+    /// 位置、关节、错误全部跟着消失。现在这个函数不会失败。
+    #[test]
+    fn a_bus_imu_never_blanks_the_whole_feedback_report() {
+        let (io, mut peer) = bus_fixture();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = stop.clone();
+        let server = std::thread::spawn(move || {
+            peer.set_timeout(Duration::from_millis(200)).unwrap();
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                if serve_once(&mut peer, imu_block(0x3000), true).is_err() {
+                    break;
+                }
+            }
+        });
+        let io = ThreadedFeetechIo::from_io(io).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while io.feedback().is_none() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let value = io.feedback().unwrap();
+        assert_eq!(value["imu_transport"]["source"], "bus");
+        assert_eq!(value["imu_transport"]["dropped"], false);
+        assert!(value["imu_transport"]["block_reads"].as_u64().unwrap() >= 1);
+        assert_eq!(value["imu_valid"], true);
+        assert_ne!(
+            value["imu"]["quat"],
+            serde_json::json!([1.0, 0.0, 0.0, 0.0]),
+            "解出来的必须是块里的姿态，不是默认值"
+        );
+        assert_eq!(io.imu_stale().run, 0);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
     }
 
     #[test]

@@ -515,7 +515,7 @@ struct RobotState {
     startup_bus_failures: AtomicU32,
     startup_error: ArcSwapOption<String>,
     #[cfg(target_os = "linux")]
-    native_imu: ArcSwapOption<duck_control::Bno08x>,
+    native_imu: ArcSwapOption<duck_control::ImuSource>,
     /// Motor-bus voltage, EMA-smoothed, as `f64::to_bits`. Zero means *not read yet* — a
     /// distinction that has to survive to the wire, since zero volts and unknown volts look
     /// nothing alike to whoever is deciding whether to charge the robot.
@@ -1139,7 +1139,7 @@ fn spawn_control_thread(
                             return;
                         }
                     };
-                    state.native_imu.store(Some(imu.clone()));
+                    state.native_imu.store(Some(Arc::new(imu.clone())));
                     let mut attempt = 0u32;
                     while !state.shutdown.load(Ordering::Relaxed) {
                         match duck_control::feetech::ThreadedFeetechIo::open_with_imu(path, imu.clone()) {
