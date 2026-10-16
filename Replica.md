@@ -296,12 +296,52 @@ systemctl restart microduck-hd1910
 | 出错率 | 54097 次读：`read_errors=2`、`misses=2`、`dropped=false`、`reconnects=0`、`frozen_run=0` |
 | 日志 | ✅ 切到 bus 之后一条 WARN/ERROR 都没有 |
 
-**两件没做/没说清的：**
+**一件已补做、一件没说清的：**
 
-- **拔板测试**（计划里第 6 条）**没做**：小板的接法还没确认，如果它串在总线中间，拔它会连带断开后面的舵机。要做先看清接线。
+- **拔板测试**（计划里第 6 条）：**2026-10-16 补做了，见第 6.7 节。** 顺带回答了原来那个顾虑——小板
+  **不串在总线中间**，拔它一颗舵机都不影响。（2026-10-16 那场事故等于**非受控地**跑了一遍，见第 7.3 节。）
 - `transport` 里有 **6 次 `incomplete feedback ... missing_ids=[15, 3]`**（54097 分之 6，0.011%）。缺的是**舵机 15 和 3，不是 200** —— 所以不是小板把舵机挤掉了。加小板之前是不是也这样，**没有基线，未知**；频率很低且自恢复（`recovery.attempts = 0`）。
 
-### 6.7 改了哪些、没 commit
+### 6.7 拔板测试（2026-10-16 实测）
+
+计划里第 6 条，补做。做法：拔小板**自己那个插头** → 数十几秒 → 插回；板上跑一个采样器，
+每 ~0.5 秒把 `feedback` 的关键字段记一行（`/tmp/pulltest.log`，跑完即弃）。
+
+| 时刻（板子本地） | 事件 |
+|---|---|
+| ~11:21:45 | 拔掉 |
+| 11:21:55.245 | `WARN duck_control::imu: imu 小板不应答了；先把它从舵机读表里摘掉，等它回来 misses=5` |
+| 11:21:55 → 11:22:31 | 小板缺席 **36 秒** |
+| 11:22:31.592 | `INFO duck_control::imu: imu 小板回来了，重新加入读表` |
+
+| 验收项 | 结果 |
+|---|---|
+| 舵机有没有被带下去 | ✅ 缺席那 36 秒里 `complete_reads` 207557 → 212425，一次没断 |
+| 缺的到底是谁 | ✅ 每次失败帧都是 `missing_ids=[200]`、`received_bytes=330`（= 15 颗 × 22 B）——**15 颗全答了** |
+| 降级痕迹 | ✅ WARN + `dropped=true` + `imu_valid=false` + 本地 `misses` 到 5 |
+| 试探节奏 | ✅ 36 秒里 17 次试探 ≈ 2.1 秒一次（对上 `IMU_RETRY_INTERVAL`），期间 `reconnects` 一直 0 |
+| 插回去多快回来 | ✅ 2 秒内；`reconnects` 0→1、`imu_valid`→true、`error`→null |
+| 有没有锁电机故障 | ✅ 没有。`state.fatal` 只有[一个写点](microduck/duck-control/src/feetech.rs#L317)，而它[放过 `ImuUnavailable`](microduck/duck-control/src/feetech.rs#L316) |
+
+**代价**：36 秒里 17 次失败读 / 约 5000 次 = 0.34%，每次白等 12 ms；这期间 `control_valid=false`
+（这是要的效果，不是副作用）。
+
+**两处读表时别误会的：**
+
+- `imu_transport.misses` 是 [`miss_total`](microduck/duck-control/src/imu.rs#L483)，**累计值，永不归零**——
+  拔过一次，它就一直 ≥ 那一次的总数。要看「现在还在不在丢」得看 `dropped`。
+- `imu_transport.ready` 是 [`decoder` 见过够多四元数没](microduck/duck-control/src/imu.rs#L487)，
+  **不是小板在不在**；小板拔了它照样 `true`。
+
+**中途我说错一句，收回：** 按「`feedback.error` 变非 null = 锁死」喊了停。其实不是。`error` 平时确实是
+`state.fatal`（[feetech.rs:585](microduck/duck-control/src/feetech.rs#L585)），但
+[feetech.rs:601](microduck/duck-control/src/feetech.rs#L601) 在 `fatal` 为 null 时会把 **IMU 自己的错**
+填进去——所以那 36 秒里的 `error` 是降级消息，不是故障锁存。
+
+**这次没验到的**：故意重插**没有复现抖动**——一次干净的掉线、一次干净的回来。所以 7.3 节那 174 次抖动，
+**不能**就此归因于插头接触不良。
+
+### 6.8 改了哪些、没 commit
 
 ```
 duck-control/src/feetech.rs    imu_source / ImuSource / 报警旁路 / 缺席降级 / 读 200
@@ -316,3 +356,115 @@ scripts/configure.py           生成的 config 里加 imu_source='i2c'
 测试：`cargo test -p duck-control` **139 通过 0 失败**；`robotd` **145 通过 + 3 ignored**，集成 **7 通过**。
 
 **全程没 commit、没 push。** `radxa/installation.json` 没动，板上 `/root` 没动，`allow_motion` 全程 false，没写 EEPROM、没开过扭矩。
+
+---
+
+## 7: 2026-10-16 「11 万次故障」到底是什么
+
+### 7.1 现象
+
+```
+robot     unhealthy: 111169 consecutive bus read failures
+  bus       111169 consecutive read failures
+  imu       not ready, 551 stale reads — 1 in 297
+```
+
+`feedback.error = "bus transaction failed: Feetech: ID 10: alarm 0x01"`、`control_valid = false`；
+journal 里 11307 行 `WARN robotd: bus read failed error=… ID 10: alarm 0x01 consecutive=N`，N 每秒涨 50。
+看起来像总线炸了。**不是。**
+
+### 7.2 总线是好的：那 11 万行是同一条旧消息被重放
+
+`consecutive_errors` 是 **robotd 主循环**的计数器（[main.rs:2000](microduck/robotd/src/main.rs#L2000)），数的是 `safety.read()` 失败；
+而 `FeetechIo::read()` 在 `state.fatal` 非空时**永远返回 Err**（[feetech.rs:571](microduck/duck-control/src/feetech.rs#L571)），
+`feedback["error"]` 也来自同一个 `state.fatal`（:585）。
+
+**锁死之后这个数字只会一直涨，它不代表总线还在出错。** 看总线真实状况要看 worker 那边的计数器：
+
+| 证据 | 值 | 说明 |
+|---|---|---|
+| `transport.complete_reads` | 315972 → 334666 | 一直在涨 |
+| `transport.failed_reads` | 8703 → 8707 | 18694 次读里 4 次，0.02% |
+| `states[]` 15 颗 | `status` 全 0、7.7–7.8 V、28–30 °C、`valid: true` | **没有一颗在报警** |
+| `imu_valid` | true | 小板在答 |
+
+那 11 万行是**同一条** `state.fatal` 被 50 Hz 重放（[main.rs:2005](microduck/robotd/src/main.rs#L2005) 每 10 次打一行）；
+里面的「ID 10」是 10:00:58 那一刻的，不是持续的。
+
+> **判据**：故障锁死期间，`health` 的 `consecutive bus read failures` **没有诊断价值**。
+> 要看 `transport.complete_reads` 涨不涨、`states[]` 里 `status` 是不是 0。
+
+### 7.3 同时还有一件真事：小板掉线 174 次
+
+journal 里从 10:00:58.780 起，`imu 小板不应答了` / `imu 小板回来了` 成对出现，**174 回**。
+过去 4 个 boot 的掉线次数是 **0、0、0、174** —— 史上第一次。
+
+每次都**正好 2.007 秒后回来**，那正是 `IMU_RETRY_INTERVAL`（[imu.rs:304](microduck/duck-control/src/imu.rs#L304)）。
+**说明小板一直活着，只是不发。** 不是断线——是它的发送卡住了（小板要等总线空闲才发），
+一个 2 秒的空档正好把它解开。
+
+时间线：
+
+| 时刻 | 事件 |
+|---|---|
+| 10:00:58.723 | 舵机瞬时告警 `ID 10: alarm 0x01` → **锁死**电机故障 |
+| 10:00:58.780 | 小板第一次掉线（相隔 **56 ms**） |
+| 10:00:58 → 10:36:26 | 小板反复掉/回 **174** 轮 |
+| **10:36:26** | 小板最后一次回来 —— **主人这时接上了电池** |
+| 10:44 | `robot.clear_fault` 被拒（见 7.4） |
+| 10:46:58 | 重启 → 故障清掉 |
+
+**两个症状同源，都指向 10:00:58 那一下；而把它彻底治好的是 10:36 接电池，不是重启。**
+（一开始把「不再掉线」记在重启头上是错的。）
+
+**根因（2026-10-16 主人确认）：10:36:26 之前整机是 5 V USB 供电，没接电池。** 接上电池，
+56 ms 内一起爆掉的两件事同时停了。
+
+但 journal 里有个反证要说清楚：**量到的电压从头到尾没动过**。`battery_v` 是舵机自己报的
+总线电压（[main.rs:3325](microduck/robotd/src/main.rs#L3325) 的 `slow_sensors`，5 分钟一次、
+EMA 平滑）：09:51 = 7.69 V，10:01（事故那一刻）= 7.67 V，10:36:46（接了电池之后）= 7.67 V。
+**接电池那一下没有台阶。** 所以这不是「电压偏低」触发的报警，是**电源站不住**——瞬时带不动，
+舵机报一次电压告警、小板被反复顶复位。同一个软脚电源，同一秒。
+
+> 还悬着一个接线细节：既然 10:36 之前舵机总线上已经有 7.67 V，那 5 V USB 供的是 SBC
+> （和/或小板那个单独的插头），舵机总线另有 ~7.7 V 来源。这条得看接线图才能钉死。
+
+### 7.4 只读配置下，故障复位是死的
+
+`robot.clear_fault` → `reset_hardware_fault`（[main.rs:1406](microduck/robotd/src/main.rs#L1406)）
+→ `Safety::clear_fault` → `FeetechIo::clear_fault`（[feetech.rs:610](microduck/duck-control/src/feetech.rs#L610)）
+→ `relax_and_revalidate` → `set_torque(false)`
+→ **`if !self.allow_motion { return Err("read-only configuration") }`**（[feetech.rs:1276](microduck/duck-control/src/feetech.rs#L1276)）。
+
+实测返回：`{"accepted":false,"reason":"bus transaction failed: Feetech: read-only configuration"}`。
+
+而 `state.fatal = None` 全文件**只有一处**（[feetech.rs:619](microduck/duck-control/src/feetech.rs#L619)），就在 `clear_fault` 里。
+
+**结论：`allow_motion: false` 时，一旦锁死就只能重启进程。**
+复位这条路在当前配置下是死的 —— 而只读恰恰是最需要能复位的那种配置。
+
+### 7.5 收尾数据（重启后 21 分钟）
+
+| | 值 |
+|---|---|
+| 读总数 / 失败 | 126890 / **9**（0.0071%，全是良性舵机帧毛刺） |
+| `error` | null |
+| `control_valid` / `imu_valid` | true / true |
+| 小板 `misses` / `reconnects` / `dropped` | **0 / 0 / false** |
+| 小板 `block_reads` | 126881 —— **一次都没漏** |
+| journal「不应答了」 | **0 条** |
+
+对照出事时：每几秒漏 5 次、累计 `misses=1300`、掉线 174 回。
+
+### 7.6 还摆着的五个问题（没动代码）
+
+| | 问题 | 位置 |
+|---|---|---|
+| **A** | 只读配置下故障复位无效（见 7.4）——锁死只能重启 | `feetech.rs:1276` / `:619` |
+| **B** | 瞬时**电压**报警 `0x01` **第一次就锁死**，而**角度**报警 `0x02` 有 5 次重试——不对称 | `feetech.rs:423` vs `:431` |
+| **C** | 试探失败后 `dropped_at` 已是 `Some`，`misses` 继续涨但**不再打日志**，且 200 永远留在读表里、每轮白等满 12 ms | `imu.rs:366`（`wants_block`）+ `record_miss` 里的 `first` 判据 |
+| **D** | 主循环把锁死的旧消息以 50 Hz 重放——「11 万次」就是这么来的，很误导人 | `main.rs:2005` |
+| **E** | 小板一掉线，`read()` 就失败，`consecutive_errors` 照涨（2026-10-16 拔板测试里爬到 1810+ 再自己归零）——**跟 B/D 是同一个坑**：那个数字不是总线诊断。好在这条会自愈，不锁存 | `feetech.rs:576` + `main.rs:2000` |
+
+**判据（自己看的时候够用）**：`transport.last_error` 里 `missing_ids` 是 1–15 的舵机号 = 老毛刺，不用管；
+出现 `200` = 小板出事。
