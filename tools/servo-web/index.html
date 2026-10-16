@@ -183,9 +183,12 @@
 
 <script src="app.js"></script>
 
+<!-- three.js 走本地 vendor/，不连 CDN：台架上经常没网，页面不能因为拉不到一个
+     模块就整个白屏。版本钉在 0.160.0，跟原来 CDN 那条一致；换版本要连
+     vendor/three/ 一起换，见那里的 README。 -->
 <script type="importmap">
-{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-               "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/" } }
+{ "imports": { "three": "./vendor/three/three.module.js",
+               "three/addons/": "./vendor/three/addons/" } }
 </script>
 <script type="module" src="viewer.js"></script>
 </body>

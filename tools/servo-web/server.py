@@ -419,6 +419,22 @@ async def asset(request):
                         headers={"Cache-Control": "no-store"})
 
 
+# 本地 vendor/（three.js）。台架上经常没网，前端不能从 CDN 拉模块。跟 asset 同一套思路：
+# 白名单后缀 + 路径必须落在 vendor/ 里，不整目录暴露。
+# 这里要发**子目录**（前端 importmap 的 `three/addons/` 是目录前缀），所以用 {path:path} 取整段路径。
+VENDOR_DIR = os.path.join(HERE, "vendor")
+VENDOR_TYPES = {".js": "text/javascript", ".css": "text/css", ".json": "application/json",
+                ".map": "application/json", ".md": "text/markdown"}
+
+
+async def vendor_file(request):
+    path = os.path.normpath(os.path.join(VENDOR_DIR, request.path_params["path"]))
+    media = VENDOR_TYPES.get(os.path.splitext(path)[1])
+    if not media or not path.startswith(VENDOR_DIR + os.sep) or not os.path.isfile(path):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return FileResponse(path, media_type=media, headers={"Cache-Control": "no-store"})
+
+
 async def model_file(request):
     name = request.path_params["name"]
     if name not in ("model.json", "meshes.bin"):
@@ -1637,6 +1653,7 @@ app = Starlette(routes=[
     Route("/app.js", asset),
     Route("/viewer.js", asset),
     Route("/imu_attitude.js", imu_attitude_file),
+    Route("/vendor/{path:path}", vendor_file),
     Route("/api/info", info),
     Route("/api/poses", poses),
     Route("/api/logfile", logfile),
