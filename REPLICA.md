@@ -476,3 +476,123 @@ EMA 平滑）：09:51 = 7.69 V，10:01（事故那一刻）= 7.67 V，10:36:46�
 
 **判据（自己看的时候够用）**：`transport.last_error` 里 `missing_ids` 是 1–15 的舵机号 = 老毛刺，不用管；
 出现 `200` = 小板出事。
+
+## 8: 2026-10-16 打开 motion —— 鸭子真的站起来了
+
+### 8.1 复核方向：实物上 15 颗逐颗掰过
+
+把鸭子放平、**扭矩全关**，用手逐颗掰 1–15，同时看调试台的 3D 是不是往同一边转。
+读数用一个只读的 `/ws` 跟随脚本（`/tmp/wstail.py`，**只收不发**，一条指令都不发），
+把每颗的变化打成 `ID n 旧 → 新  ±delta` 一行。
+
+每颗都出了干净的单关节 delta（例：ID 4 `1990→1869`、ID 12 `1783→1347`、ID 11 `1920→2100` 穿过 2048）。
+
+**结论：15 颗全 `-1`，跟 `tools/servo-web/directions.json` 和板上 `radxa/installation.json`
+两边都一致，一颗没翻。**
+
+顺带清掉一处过期说明：`directions.json` 的 `_note` 原来写着「本机 1-15 还没在实物上核过：
+radxa 里写的是 11/12 为 +1、其余 -1，跟这里不一致」。**那份不一致早就不存在了** ——
+板上 11/12 早在 `34effa3` 就翻成了 −1，只是 `0f19aa7` 写的说明没跟着改。`_note` 已按本次实测重写。
+
+### 8.2 零点：只到「旁证级」，**没做过硬校准**
+
+手法：把鸭子摆成折叠的样子放桌上，读 15 颗，跟官方折叠位比。做了三次（越摆越像）。
+
+| 第几次 | 除头颈外 13 颗平均\|偏差\| | 最大 |
+|---|---|---|
+| 1（摆得不像） | 15.4° | 63.0°（右踝） |
+| 2 | **3.0°** | 12.7°（左踝） |
+| 3 | **2.5°** | 6.7°（左踝） |
+
+**左右对称性比绝对偏差更能说明问题**：膝左右差 **0.26°**（读到 −2043 tick，官方镜像值 −2046）——
+两颗膝是同一个机械限位顶住的，对得这么齐说明**膝的零点没问题**。髋横滚 0.9°、髋偏航 2.6° 也好。
+踝左右差 15.7°、髋俯仰差 9.6°，但这两个在折叠位**不是接触点**（踝是 0、脚悬着），
+差的是**手摆的余量**，不是零点。
+
+> **一个会骗人的坑：头/颈那 −56°/−60° 不是零点错。** 页面用的基准 `FOLD_CALIB` 把 ID 11/12
+> **故意改成 0**，基准名字就叫「官方折叠（头颈摆正）」—— 理由是官方 FOLD 里颈/头的 57°
+> 不是接触点、眼睛摆不准（[server.py:828](tools/servo-web/server.py#L828)）。
+> 而实物按真折叠摆时头颈就是收到 1 rad = 57.3°（1396 tick），所以那一列会显示差 57°。
+> 按 `OFFICIAL_FOLD` 比才对：三次读到 11/12 = `1411/1366`、`1479/1396`，**差 1.3° / 0.0°**。
+> **拿页面那列直接读，会以为头颈零点偏了 60°。**
+
+**判决：零点「大致对」，落在旁证级** ——
+顶零件的（膝、髋横滚/偏航）1–3°、左右对称到 0.26°；靠重力的（头/颈）1–3°；悬空的（踝、髋俯仰）十几度。
+**没硬校准过**（硬校准要机械接触自定位的那种折叠位，这三次都是手摆的）。
+
+### 8.3 打开 motion：三个开关，**一行代码没改**
+
+| 文件 | 字段 | 改成 |
+|---|---|---|
+| `local/feetech.json` | `allow_motion` | `true` |
+| `radxa/installation.json` | `calibration_verified` | `true` |
+| `radxa/installation.json` | `imu_pose_verified` | `true` |
+
+然后 `systemctl restart microduck-hd1910`。**三个必须一起改**：`allow_motion` 是那道闸，
+另外两个是钥匙 —— 只翻 `allow_motion` 而不翻那两个，[feetech.rs:113](microduck/duck-control/src/feetech.rs#L113)
+会直接返回 `motion requires verified joint and IMU installation`，**服务根本起不来**。
+
+这是上游故意设的**人工签字闸门**（设计意图：没人确认装好了就别让鸭子动）。三个开关合起来松开三处：
+`set_torque`（[:1276](microduck/duck-control/src/feetech.rs#L1276)）、`write`（[:1240](microduck/duck-control/src/feetech.rs#L1240)）、
+`feedback()["motion_available"]`（[:1197](microduck/duck-control/src/feetech.rs#L1197)）。
+
+改前备份在 `local/feetech.json.bak-premotion` 和 `radxa/installation.json.bak-premotion`，
+覆盖回去 + restart 就回到只读。
+
+**实测（2026-10-16）**：
+- 重启后**一颗舵机都没自己动**（前后两帧逐颗比过）—— 启动路径读当前姿势当参考并保持
+- app 上「使能站立」从灰变可点，**点完鸭子自己站了起来**
+- 随后 `motion_available` / `homed` / `policy_enabled` 全 true，`error: null`，`servo_gains_verified` true
+- 跟站姿的差：14 颗 ±2° 内；踝（−6.5/+6.8）和髋俯仰（+6.1/−5.6）差 6–7° ——
+  **那是重力压着 PD 的静态误差，不是零点问题**（腿在承重）
+- 重力 `[0.026, −0.016, −1.0]`，立得正、水平 → 顺带再确认 ID 200 的 mount 是对的（见 6.4）
+
+> **使能 = 只把关节摆到站姿，鸭子不会自己起来 —— 起点必须是「大致站着」。**
+>
+> `robot.init` / app 的「使能站立」做的永远是同一件事：开扭矩，把 15 个关节**从当前读数
+> 线性插值**到 `DEFAULT_POSITION`（站姿，[model.rs:39](microduck/duck-control/src/model.rs#L39)），
+> `HOME_RAMP = 2 秒`（[main.rs:94](microduck/robotd/src/main.rs#L94)）。
+> **纯插值 —— 没有接触判断、没有平衡，而且摔倒了也不拦**
+> （[main.rs:2391](microduck/robotd/src/main.rs#L2391)：`the fall verdict gates nothing, so the pose
+> ramp moves a robot lying on the floor like any other tick`）。
+>
+> **实测（2026-10-16，两种起点）**：
+>
+> | 起点 | 结果 |
+> |---|---|
+> | **折着趴着** | **站起来了** —— 腿在身子底下，把腿驱到站姿就是把身子**顶**起来（脚着地 = 站起来） |
+> | **躺着** | **起不来** —— 只是「关节摆成了站姿、鸭子还在地上」，得人工扶起来。躺平时身子在地上、腿在旁边，驱到站姿只是把腿摆成那个形状；随后行走策略接手的是一个「躺着但腿摆着站姿」的怪状态 |
+>
+> **规则：使能之前鸭子得先大致是站着的姿势，不是就先用手摆。**
+> 躺着进了那个怪状态时，先按停止 / relax，别让它跑策略。
+>
+> 本来有安全网 —— 启动时若判定「坐着」（`leg_deviation > 0.30 rad`），代码会走 **sitstand 网络**
+> 起身、绕过这条盲 ramp（`begin_boot_rise()`，[main.rs:2069](microduck/robotd/src/main.rs#L2069)）——
+> 但本机 `params.toml` 里 `sitstand = "none"`，`has_sitstand()` 为假，那条路**没装**
+> （[main.rs:1779](microduck/robotd/src/main.rs#L1779)）；`limp_fall: false`，「摔下去之前先变软」
+> 那套也关着。**开机前把鸭子摆到站姿附近，或人在旁边接。**
+
+**遗留的诚实说明**：`calibration_verified: true` 是**我们替它签的字**，不是测出来的
+（见 8.2，只到旁证级）。`radxa/installation.json` 自己的 `purpose` 字段原文仍是
+"Read-only wiring/mapping example."。
+
+### 8.4 手机 app：板上只有后端，没有界面
+
+`microduck_app/backend/`（`microduck-app-server`）是**手机 app 的后端**，不是 app 本身 ——
+unit 名字就写着 `MicroDuck HD1910 native runtime and APK backend`。
+
+| 它干什么 | 怎么做 |
+|---|---|
+| **发界面** | `ServeDir` 指向 `MICRODUCK_APP_WEB`，默认 `../web/dist`。**板上 `/home/duck/workspace/web/dist` 不存在**，所以它实际没在发界面，纯当 API 用 |
+| **让 app 找到鸭子** | UDP 38882 收广播 `MICRODUCK_DISCOVER_V1`，回 JSON（名字、端口、要不要 token） |
+| **转发命令** | WebSocket `/ws`，bind `0.0.0.0:38880`（[run_hardware.sh](microduck/scripts/run_hardware.sh) 里 `MICRODUCK_APP_ALLOW_OPEN_LAN=1` 且不设 token → 局域网谁都能连），经 `MICRODUCK_ROBOTD_SOCKET` 转给 robotd |
+
+它跟 `microduck/` 那个 workspace 是**两个独立工程**。板上搜不到 `.apk`，手机 app 是装在手机上的。
+
+命令白名单 + 限幅在 [main.rs:20](microduck_app/backend/src/main.rs#L20)：
+`move`(vx≤0.30 / vy≤0.04 / vyaw≤0.8)、`mouth`、`head`、`skill`、`stop`、`enable`、`clear_fault`、`claim_control`。
+`claim_control` 决定唯一控制者；每条命令带 `_time`，**超过 300 ms 丢弃 = 死手开关**（app 卡住或断网自动停）。
+
+> **`clear_fault` 就是 app 上那个「复位故障」按钮**（[main.rs:221](microduck_app/backend/src/main.rs#L221)），
+> 转给 robotd 的正是不久前把总线锁死的 `robot.clear_fault`（7.4 节）。**打开 motion 之后这条路通了**
+> —— `set_torque(false)` 不再被拒，所以那个死锁自己解开了，以后遇到故障按它有效，不用重启服务。

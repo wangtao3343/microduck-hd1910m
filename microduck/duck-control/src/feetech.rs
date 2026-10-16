@@ -246,6 +246,19 @@ pub struct FeetechIo {
     /// 去解析错误文本，是因为 `missing_ids=[…]` 没法安全地搜 "200" ——
     /// `received_bytes=200` 会一起命中。
     imu_silent: bool,
+    /// 小板那一行的帧 ERROR 字节（**必须为 0**，非 0 只记录、不采信）。
+    ///
+    /// 帧 ERROR 字节是舵机的东西。小板自己的诊断位在数据块第 13 字节里
+    /// （`board_status`），固件的 `make_status` 把帧 ERROR 写死成 0。实测这颗小板偶尔
+    /// 会回一个非 0 的 ERROR（线上看到的是 `0x80`），而那会一路走到
+    /// `FeedbackState::latch_motor_fault` —— `Bus` 不在它的豁免名单里（只放过
+    /// `ImuUnavailable`），一条小板的帧噪声就锁死整条总线。所以这里只记不报。
+    board_frame_error: u8,
+    /// 小板数据块第 13 字节：它自己的状态位。
+    ///
+    /// `control_table_status`：0x01 融合没就绪 / 0x02 SPI 等通信故障 / 0x04 身份不符 /
+    /// 0x08 采样积压。**这才是小板的真话**，帧 ERROR 不是。
+    board_status: u8,
 }
 
 #[derive(Default, Debug, Clone, Serialize)]
@@ -308,7 +321,27 @@ struct FeedbackState {
     write_turn_until: Option<Instant>,
     pending_target: Option<PendingTarget>,
     last_written_at: Option<Instant>,
-    angle_alarm_retries: u8,
+    // 会自己好的瞬时报警（电压 0x01、角度 0x02、来路不明的 0x80）共用的重试计数。
+    // 硬故障不走这里，第一下就锁。
+    transient_alarm_retries: u8,
+}
+
+/// 抖一下就会自己好的瞬时报警：电压 `0x01`、角度 `0x02`、和来路不明的 `0x80`。
+///
+/// 2026-10-16「走着走着就不走了」就是 `0x01` 被当成硬故障、第一下就锁死造成的：
+/// 一次电源抖动 → 锁死 → `read()` 永远 Err → 策略不再发目标 → 鸭子停住而且不会自愈。
+///
+/// `0x80` 是同一天下午「老摔跤」的原因。全天它出现在 **5 个互不相干的舵机**上
+/// （头偏航 14、头滚 13、左髋滚 9、右髋滚 4、右髋偏航 5），而真正有物理含义的过流
+/// `0x08` 整整齐齐只落在腿上（3、6、7、8、9、10、11、12）。同一个值同时"坏"在 5 个
+/// 没有共同点的地方，不像 5 个舵机真坏了；它也不是任何一个有定义的报警位。
+/// 而代价是不对称的：忽略它的最坏结果是"继续走"，采信它的结果是**断扭矩、鸭子摔**。
+///
+/// 过热 `0x04`、过流 `0x08` 这些有明确物理对应的仍然是硬故障，一次都不重试。
+fn is_transient_alarm(error: &str) -> bool {
+    ["alarm 0x01", "alarm 0x02", "alarm 0x80"]
+        .iter()
+        .any(|s| error.ends_with(s))
 }
 
 impl FeedbackState {
@@ -410,7 +443,7 @@ impl ThreadedFeetechIo {
                     state.stats.recovery = io.feedback_recovery().clone();
                     match result {
                         Ok(sample) => {
-                            state.angle_alarm_retries = 0;
+                            state.transient_alarm_retries = 0;
                             io.healthy = Some(sampled_at);
                             state.sample = Some(sample);
                             state.last_sample_at = Some(sampled_at);
@@ -420,12 +453,14 @@ impl ThreadedFeetechIo {
                         Err(error) => {
                             state.stats.failed_reads += 1;
                             state.stats.last_error = Some(error.to_string());
-                            if scheduled_bus && error.to_string().ends_with("alarm 0x02") {
+                            // 瞬时报警给五次额度（跟角度 0x02 一样），硬故障仍然第一下就锁；
+                            // 额度用完照样锁，锁存语义没变。
+                            if scheduled_bus && is_transient_alarm(&error.to_string()) {
                                 // Spread the existing five retries over bounded bus cycles.
-                                state.angle_alarm_retries = state.angle_alarm_retries.saturating_add(1);
+                                state.transient_alarm_retries = state.transient_alarm_retries.saturating_add(1);
                                 state.sample = None;
                                 io.healthy = None;
-                                if state.angle_alarm_retries > 5 { state.latch_motor_fault(&error); }
+                                if state.transient_alarm_retries > 5 { state.latch_motor_fault(&error); }
                             } else if !matches!(error, IoError::IncompleteFeedback(_)) {
                                 state.sample = None;
                                 state.latch_motor_fault(&error);
@@ -622,7 +657,7 @@ impl RobotIo for ThreadedFeetechIo {
                 state.ready = true;
                 state.write_turn_until = None;
                 state.pending_target = None;
-                state.angle_alarm_retries = 0;
+                state.transient_alarm_retries = 0;
                 state.last_written_at = None;
                 self.observation_at = None;
                 self.feedback.1.notify_all();
@@ -818,6 +853,8 @@ impl FeetechIo {
             ids,
             imu,
             limits: vec![],
+            board_frame_error: 0,
+            board_status: 0,
             allow_motion: cfg.allow_motion,
             enabled: false,
             healthy: None,
@@ -984,6 +1021,25 @@ impl FeetechIo {
                         alarm = Some(err(format!("ID {id}: alarm 0x{status:02x}")));
                     }
                 }
+                if id == IMU_DXL_ID {
+                    // 小板不是舵机，帧 ERROR 那一格对它没有定义（固件 `make_status` 把它
+                    // 写死成 0）。实测它会偶尔回一个 0x80 —— 采信它，一条帧噪声就会经
+                    // `packet_error` 走到 `latch_motor_fault`（`Bus` 不在豁免名单里，它只
+                    // 放过 `ImuUnavailable`），锁死整条总线、鸭子定在站姿上不动。所以
+                    // **只记不采**：数据照收，小板自己的状态位在块的第 13 字节里，另外记。
+                    // 变了才说一句，否则 50 Hz 的同一行会把 journal 冲垮。
+                    let frame_error = bytes[4];
+                    if frame_error != self.board_frame_error {
+                        if frame_error != 0 {
+                            tracing::warn!(
+                                error = format!("0x{frame_error:02x}"),
+                                "IMU 小板的帧 ERROR 字节非 0 —— 不采信，只记录（它不是舵机）"
+                            );
+                        }
+                        self.board_frame_error = frame_error;
+                    }
+                    alarm = None;
+                }
                 if let Some(error) = alarm {
                     // A retryable angle alarm must not hide another servo's hard alarm.
                     if packet_error
@@ -1049,10 +1105,10 @@ impl FeetechIo {
 
     fn sync_read_ids(&mut self, ids: &[u8], address: u8, size: u8) -> Result<Vec<Vec<u8>>> {
         if self.transaction_deadline.is_some() { return self.sync_read_ids_once(ids, address, size); }
-        // Retry only the confirmed angle-sensor alarm, never replay motor writes.
+        // Retry only the alarms that clear themselves, and never replay motor writes.
         for attempt in 0..=5 {
             match self.sync_read_ids_once(ids, address, size) {
-                Err(e) if attempt < 5 && e.to_string().ends_with("alarm 0x02") => continue,
+                Err(e) if attempt < 5 && is_transient_alarm(&e.to_string()) => continue,
                 result => return result,
             }
         }
@@ -1170,6 +1226,18 @@ impl FeetechIo {
         if let Some(row) = rows.get(NUM_JOINTS) {
             let mut block = [0u8; IMU_BLOCK_LEN];
             block.copy_from_slice(&row[offset..offset + IMU_BLOCK_LEN]);
+            // 小板自己的状态位（块的第 13 字节，紧跟 12 字节数据之后）。跟帧 ERROR 一样
+            // 变了才说：这里每 tick 都跑到，不判变化就是 50 Hz 的同一行。
+            let status = row[offset + IMU_BLOCK_LEN + 1];
+            if status != self.board_status {
+                if status != 0 {
+                    tracing::warn!(
+                        status = format!("0x{status:02x}"),
+                        "IMU 小板自己报的状态位非 0"
+                    );
+                }
+                self.board_status = status;
+            }
             let run = self.imu.observe_block(&block, Instant::now());
             // 说出来，否则这些计数器就是没人看的数字 —— 但要等这段连续重复长到有意义
             // 再说。再往后限流，因为一块停止刷新的小板每一轮都会产出一样的一行，
@@ -1195,6 +1263,7 @@ impl FeetechIo {
             "reference_native_io":self.reference_native,"saturated_ids":self.saturated_ids,
             "states":states,"joints":self.joints,"backend":"feetech_native",
             "motion_available":self.allow_motion,
+            "board_frame_error":self.board_frame_error,"board_status":self.board_status,
             "servo_gain_profile":self.servo_gain_profile,"servo_gains_verified":self.servo_gains_verified});
         self.slow = Some(slow);
         if enable_offset == 1 {
@@ -1522,7 +1591,9 @@ mod tests {
     fn explicit_reset_verifies_all_torque_off_before_clearing_and_never_writes_goals() {
         use std::sync::{Arc, Mutex, Condvar, atomic::AtomicBool};
         use serialport::SerialPort;
-        for (alarm, still_enabled) in [(0, false), (0x80, false), (0, true)] {
+        // 用 0x08 过流当"清不掉的报警"：它是硬故障，第一下就锁。0x80 从 2026-10-16
+        // 起归到瞬时那一档（会重试五次），拿它当"锁死"的样本已经不是这条测试的意思了。
+        for (alarm, still_enabled) in [(0, false), (0x08, false), (0, true)] {
             let (mut bus, mut peer) = fixture();
             bus.allow_motion = true;
             let ids = bus.ids.clone();
@@ -1552,7 +1623,7 @@ mod tests {
                 assert!(io.read().is_ok());
                 assert!(io.feedback().unwrap()["error"].is_null());
             } else {
-                let expected = if still_enabled { "torque readback mismatch" } else { "alarm 0x80" };
+                let expected = if still_enabled { "torque readback mismatch" } else { "alarm 0x08" };
                 assert!(result.unwrap_err().to_string().contains(expected));
                 assert!(io.read().is_err());
                 assert!(io.feedback.0.lock().unwrap().fatal.is_some());
@@ -1638,7 +1709,9 @@ mod tests {
                 transaction_deadline: None,
                 alternate_feedback: false,
                 imu_silent: false,
-            },
+                board_frame_error: 0,
+                board_status: 0,
+                },
             server,
         )
     }
@@ -1842,6 +1915,36 @@ mod tests {
         let sensors = io.read().expect("健康的小板不该被当成报警");
         server.join().unwrap();
         assert!(sensors.imu.quat[1].abs() > 0.0 || sensors.imu.quat[2].abs() > 0.0);
+    }
+
+    /// 小板回来的帧 ERROR 字节非 0，**不许**变成电机故障。
+    ///
+    /// 线上实测到的就是这一条：`ID 200: alarm 0x80`。帧 ERROR 是舵机的东西，小板自己的
+    /// 状态位在数据块第 13 字节里，固件把它这一格写死成 0。采信它的话，`packet_error`
+    /// 会把一个 `IoError::Bus` 交给 `latch_motor_fault` —— 而它只豁免 `ImuUnavailable`
+    /// —— 一条小板的帧噪声就锁死整条总线，鸭子在站姿上定住不动。
+    #[test]
+    fn a_board_frame_error_byte_is_not_a_motor_fault() {
+        let (mut io, mut peer) = bus_fixture();
+        let server = std::thread::spawn(move || {
+            let (address, size, asked) = read_request(&mut peer).unwrap();
+            let off = (56 - address) as usize;
+            for id in &asked {
+                let mut raw = vec![0u8; size as usize];
+                if *id == IMU_DXL_ID {
+                    raw[off..off + IMU_BLOCK_LEN].copy_from_slice(&imu_block(0x3000));
+                } else {
+                    raw[off..off + 15].copy_from_slice(&servo_row());
+                }
+                // 只有小板那一帧带 ERROR；舵机照常为 0，别的测试钉的就是它们不能漏。
+                send_row(&mut peer, *id, if *id == IMU_DXL_ID { 0x80 } else { 0 }, &raw);
+            }
+            peer
+        });
+        let sensors = io.read().expect("小板的帧 ERROR 不该让整条关节读失败");
+        let _peer = server.join().unwrap();
+        assert_ne!(sensors.imu.quat, [1.0, 0.0, 0.0, 0.0], "块照收，姿态照解");
+        assert_eq!(io.board_frame_error, 0x80, "记下来，好知道小板在闹什么");
     }
 
     /// 小板不吭声，不能把舵机反馈拖下水。
@@ -2946,6 +3049,54 @@ mod tests {
         assert!(io.read().unwrap_err().to_string().ends_with("alarm 0x02"));
         worker.join().unwrap();
         assert!(io.healthy.is_none());
+    }
+    #[test]
+    fn pty_transient_voltage_alarm_retries_like_an_angle_alarm() {
+        // 电压 0x01 是瞬时报警 —— 2026-10-16「走着走着就不走了」就是它第一下被当硬故障锁死。
+        // 判据用「主板发了几次请求」：试满五次重试就是 6 次，不重试就是 1 次。
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        let (mut io, mut peer) = fixture();
+        let ids = io.ids.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let answered = Arc::new(AtomicUsize::new(0));
+        let (s, n) = (stop.clone(), answered.clone());
+        let worker = std::thread::spawn(move || {
+            peer.set_timeout(Duration::from_millis(60)).unwrap();
+            while !s.load(Ordering::Relaxed) {
+                let mut request = vec![0; 23];
+                if peer.read_exact(&mut request).is_err() { continue; }
+                n.fetch_add(1, Ordering::Relaxed);
+                for id in &ids {
+                    let mut raw = [0u8; 15];
+                    raw[1] = 8;
+                    let mut packet = vec![255, 255, *id, 17, 1];
+                    packet.extend(raw);
+                    packet.push(checksum(&packet[2..]));
+                    if peer.write_all(&packet).is_err() { return peer; }
+                }
+            }
+            peer
+        });
+        assert!(io.read().unwrap_err().to_string().ends_with("alarm 0x01"));
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        assert_eq!(answered.load(Ordering::Relaxed), 6, "电压报警必须跟角度报警一样试满五次");
+        assert!(io.healthy.is_none());
+    }
+    #[test]
+    fn a_hard_alarm_is_never_retried_but_a_transient_one_is() {
+        assert!(is_transient_alarm("bus transaction failed: Feetech: ID 10: alarm 0x01"));
+        assert!(is_transient_alarm("bus transaction failed: Feetech: ID 7: alarm 0x02"));
+        // 0x80 出现在 5 个没有共同点的舵机上，不是真故障 —— 它必须走重试，不能第一下就锁。
+        assert!(is_transient_alarm("bus transaction failed: Feetech: ID 14: alarm 0x80"));
+        assert!(is_transient_alarm("bus transaction failed: Feetech: ID 4: alarm 0x80"));
+        // 有物理对应的还是硬故障。
+        for hard in ["alarm 0x04", "alarm 0x08", "alarm 0x10", "alarm 0x20"] {
+            assert!(!is_transient_alarm(hard), "{hard} 是硬故障，不该重试");
+        }
     }
     #[test]
     fn pty_write_is_only_position_no_current_gain_or_eeprom() {
