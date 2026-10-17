@@ -144,6 +144,29 @@ WARN robotd: waiting for native Feetech/BNO085; startup reads only
 
 > **2026-10-15**：这条已经被第 6 节取代 —— 现在不用 BNO085 了，从总线读 ID 200。
 
+### 4.5 一共有哪些 daemon，装了哪些（2026-10-17 查）
+
+`microduck-hd1910.service` 是板上**唯一**的 unit，`ExecStart` 跑 `scripts/run_hardware.sh`，
+那个脚本起两个进程就结束。仓库 `microduck/` 里其实有 **7 个 daemon**，`microduck_app` 那边还有个后端：
+
+| unit | 干什么 | 板上 | 需要吗 |
+|---|---|---|---|
+| `robotd` | 控制循环 / 舵机 / IMU / 策略 | **跑着** | **必需**，没它鸭子就是块铁 |
+| `microduck-app-server`（`microduck_app/`） | 手机 app 后端，绑 `0.0.0.0:38880` | **跑着**（同一个 unit 里起） | 要用手机 app 就要 |
+| `padd` | 手柄意图客户端（`gilrs`） | 没装 | **加手柄时要它** |
+| `btd` | 蓝牙 BLE 传输适配 | 没装 | 手机走 LAN 就不用；走蓝牙才要 |
+| `configd` | 配 wifi / 身份 | 没装 | 现在是手改配置文件，不用 |
+| `tofd` | 头上 ToF 传感器 | 没装 | 有 ToF 硬件才要 |
+| `mediad` | 摄像头 + WebRTC 网关 | 没装 | 见 §9，没摄像头不做 |
+| `updaterd` | 更新守护 | **masked** | 我们是手动部署，不用 |
+
+**让鸭子走路，只需要 `robotd`。** 其余全是可选的，缺了不影响它走。
+
+unit 文件在各组件自己的 `systemd/` 下（`microduck/{btd,configd,padd,tof,mediad,updater}/systemd/`）。
+`padd` 和 `mediad` 都带 C 依赖（`gilrs`→`libudev`、GStreamer），交叉编译得先把
+`scripts/cross-sysroot.sh` 那套 sysroot 跑起来；而 `scripts/build.sh` 目前只编
+`-p robotd -p robotctl`，其余二进制**从来没生成过**。
+
 ## 5: 关节的正负方向（`direction`）
 
 ### 5.1 这个字段是什么
@@ -359,117 +382,56 @@ scripts/configure.py           生成的 config 里加 imu_source='i2c'
 
 ---
 
-## 7: 2026-10-16 「11 万次故障」到底是什么
+## 7: 2026-10-16 的两件真事
 
-### 7.1 现象
+> **原来这一大段「11 万次故障」已经删了 —— 那是测试过程里的假象，不是故障。**
+> 锁死之后 `consecutive bus read failures` 只是同一条 `state.fatal` 被 50 Hz 重放
+> （[main.rs:2005](microduck/robotd/src/main.rs#L2005)），数字每秒涨 50，**没有诊断价值**。
+> 要判断总线真实状况，看 `transport.complete_reads` 涨不涨、`states[]` 里 `status` 是不是 0。
 
-```
-robot     unhealthy: 111169 consecutive bus read failures
-  bus       111169 consecutive read failures
-  imu       not ready, 551 stale reads — 1 in 297
-```
+### 7.1 IMU 小板老是掉 —— **接线不良（已定案）**
 
-`feedback.error = "bus transaction failed: Feetech: ID 10: alarm 0x01"`、`control_valid = false`；
-journal 里 11307 行 `WARN robotd: bus read failed error=… ID 10: alarm 0x01 consecutive=N`，N 每秒涨 50。
-看起来像总线炸了。**不是。**
+症状：`imu ready, N stale reads — 1 in M` 的 M 很小；journal 里 `imu 小板不应答了` /
+`imu 小板回来了` 成对刷，最狠一次静了 **8 分 07 秒**。
 
-### 7.2 总线是好的：那 11 万行是同一条旧消息被重放
+**根因：小板那个连接器的焊接/压接不可靠。换成原厂 AMP2.0 线就好了，鸭子能走。**
 
-`consecutive_errors` 是 **robotd 主循环**的计数器（[main.rs:2000](microduck/robotd/src/main.rs#L2000)），数的是 `safety.read()` 失败；
-而 `FeetechIo::read()` 在 `state.fatal` 非空时**永远返回 Err**（[feetech.rs:571](microduck/duck-control/src/feetech.rs#L571)），
-`feedback["error"]` 也来自同一个 `state.fatal`（:585）。
-
-**锁死之后这个数字只会一直涨，它不代表总线还在出错。** 看总线真实状况要看 worker 那边的计数器：
-
-| 证据 | 值 | 说明 |
-|---|---|---|
-| `transport.complete_reads` | 315972 → 334666 | 一直在涨 |
-| `transport.failed_reads` | 8703 → 8707 | 18694 次读里 4 次，0.02% |
-| `states[]` 15 颗 | `status` 全 0、7.7–7.8 V、28–30 °C、`valid: true` | **没有一颗在报警** |
-| `imu_valid` | true | 小板在答 |
-
-那 11 万行是**同一条** `state.fatal` 被 50 Hz 重放（[main.rs:2005](microduck/robotd/src/main.rs#L2005) 每 10 次打一行）；
-里面的「ID 10」是 10:00:58 那一刻的，不是持续的。
-
-> **判据**：故障锁死期间，`health` 的 `consecutive bus read failures` **没有诊断价值**。
-> 要看 `transport.complete_reads` 涨不涨、`states[]` 里 `status` 是不是 0。
-
-### 7.3 同时还有一件真事：小板掉线 174 次
-
-journal 里从 10:00:58.780 起，`imu 小板不应答了` / `imu 小板回来了` 成对出现，**174 回**。
-过去 4 个 boot 的掉线次数是 **0、0、0、174** —— 史上第一次。
-
-每次都**正好 2.007 秒后回来**，那正是 `IMU_RETRY_INTERVAL`（[imu.rs:304](microduck/duck-control/src/imu.rs#L304)）。
-**说明小板一直活着，只是不发。** 不是断线——是它的发送卡住了（小板要等总线空闲才发），
-一个 2 秒的空档正好把它解开。
-
-时间线：
-
-| 时刻 | 事件 |
+| | `1 in M` |
 |---|---|
-| 10:00:58.723 | 舵机瞬时告警 `ID 10: alarm 0x01` → **锁死**电机故障 |
-| 10:00:58.780 | 小板第一次掉线（相隔 **56 ms**） |
-| 10:00:58 → 10:36:26 | 小板反复掉/回 **174** 轮 |
-| **10:36:26** | 小板最后一次回来 —— **主人这时接上了电池** |
-| 10:44 | `robot.clear_fault` 被拒（见 7.4） |
-| 10:46:58 | 重启 → 故障清掉 |
+| 换线前（2026-10-16 21:01 实测） | **13** |
+| 换线后（2026-10-16 22:21 重启后累计） | **1133** |
 
-**两个症状同源，都指向 10:00:58 那一下；而把它彻底治好的是 10:36 接电池，不是重启。**
-（一开始把「不再掉线」记在重启头上是错的。）
+差约 87 倍。当时很像、但**不是**的两个方向：
 
-**根因（2026-10-16 主人确认）：10:36:26 之前整机是 5 V USB 供电，没接电池。** 接上电池，
-56 ms 内一起爆掉的两件事同时停了。
+- **不是小板本身** —— 它的 `block_reads` 一次都没漏（126881 / 126881）
+- **不是时钟** —— 小板上的 `X1`（16 MHz 有源晶振）虽然按硬件说明 2026-09-08 起默认贴片、
+  使能脚固定接 3.3 V（MCU 关不掉它），但固件 `BOARD_USE_HSE_BYPASS 0` 走内部 HSI16，
+  **它没进时钟树**（`tools/imu_to_dxl/firmware/Core/Inc/board_config.h:7`）。
+  有源振荡器输出脚虚焊的症状是「时钟整个没了」，跟这里那种零星坏字节对不上。
 
-但 journal 里有个反证要说清楚：**量到的电压从头到尾没动过**。`battery_v` 是舵机自己报的
-总线电压（[main.rs:3325](microduck/robotd/src/main.rs#L3325) 的 `slow_sensors`，5 分钟一次、
-EMA 平滑）：09:51 = 7.69 V，10:01（事故那一刻）= 7.67 V，10:36:46（接了电池之后）= 7.67 V。
-**接电池那一下没有台阶。** 所以这不是「电压偏低」触发的报警，是**电源站不住**——瞬时带不动，
-舵机报一次电压告警、小板被反复顶复位。同一个软脚电源，同一秒。
+`0x80` 那批报警大概率也是同一处：接头松的时候小板会去抢那条半双工总线，
+冲掉的字节落在谁的帧里就算谁的。代码那边已经改过，见 7.3。
 
-> 还悬着一个接线细节：既然 10:36 之前舵机总线上已经有 7.67 V，那 5 V USB 供的是 SBC
-> （和/或小板那个单独的插头），舵机总线另有 ~7.7 V 来源。这条得看接线图才能钉死。
-
-**接上电池之后也不是就没事了 —— 所以上面那条根因没定死。** 11:48:49 小板又静了一次，
-**8 分 07 秒**（11:56:56 才回来），那时已经在电池上。8 分钟这个长度也不像原来那种抖：
-抖动每次 2 秒就回来，而这一次是**每一轮试探都失败**，整段没人应答。主人对当时有没有碰过
-接线、动过鸭子是「没准、忘了」，所以这条就先摆着。
-
-两件事同时起、同时停仍然说明 10:00:58 那一下是**同一个原因**；但它是不是「没接电池」，
-现在只能说最像，不能说就是。
-
-### 7.4 只读配置下，故障复位是死的
+### 7.2 只读配置下，故障复位是死的
 
 `robot.clear_fault` → `reset_hardware_fault`（[main.rs:1406](microduck/robotd/src/main.rs#L1406)）
-→ `Safety::clear_fault` → `FeetechIo::clear_fault`（[feetech.rs:610](microduck/duck-control/src/feetech.rs#L610)）
+→ `Safety::clear_fault` → `FeetechIo::clear_fault`
 → `relax_and_revalidate` → `set_torque(false)`
-→ **`if !self.allow_motion { return Err("read-only configuration") }`**（[feetech.rs:1276](microduck/duck-control/src/feetech.rs#L1276)）。
+→ **`if !self.allow_motion { return Err("read-only configuration") }`**（`feetech.rs` 的 `clear_fault`）。
 
 实测返回：`{"accepted":false,"reason":"bus transaction failed: Feetech: read-only configuration"}`。
 
-而 `state.fatal = None` 全文件**只有一处**（[feetech.rs:619](microduck/duck-control/src/feetech.rs#L619)），就在 `clear_fault` 里。
+而 `state.fatal = None` 全文件**只有一处**，就在 `clear_fault` 里。
 
 **结论：`allow_motion: false` 时，一旦锁死就只能重启进程。**
 复位这条路在当前配置下是死的 —— 而只读恰恰是最需要能复位的那种配置。
 
-### 7.5 收尾数据（重启后 21 分钟）
-
-| | 值 |
-|---|---|
-| 读总数 / 失败 | 126890 / **9**（0.0071%，全是良性舵机帧毛刺） |
-| `error` | null |
-| `control_valid` / `imu_valid` | true / true |
-| 小板 `misses` / `reconnects` / `dropped` | **0 / 0 / false** |
-| 小板 `block_reads` | 126881 —— **一次都没漏** |
-| journal「不应答了」 | **0 条** |
-
-对照出事时：每几秒漏 5 次、累计 `misses=1300`、掉线 174 回。
-
-### 7.6 还摆着的五个问题（没动代码）
+### 7.3 五个问题（B 已修，其余没动代码）
 
 | | 问题 | 位置 |
 |---|---|---|
-| **A** | 只读配置下故障复位无效（见 7.4）——锁死只能重启 | `feetech.rs:1276` / `:619` |
-| **B** | 瞬时**电压**报警 `0x01` **第一次就锁死**，而**角度**报警 `0x02` 有 5 次重试——不对称 | `feetech.rs:423` vs `:431` |
+| **A** | 只读配置下故障复位无效（见 7.2）——锁死只能重启 | `feetech.rs` 的 `clear_fault` |
+| **B** | ~~瞬时**电压**报警 `0x01` **第一次就锁死**，而**角度**报警 `0x02` 有 5 次重试——不对称~~ **2026-10-16 已修并上板**（commit `ba26c5a`）：`is_transient_alarm` 让 `0x01` / `0x02` / `0x80` 都走五次重试（50 Hz 下约 100 ms），过温 `0x04`、过流 `0x08` 仍**第一下就锁**。`0x80` 不是飞特定义的任何报警位，全天落在 5 个互不相干的舵机上（14/13/9/4/5），而 `0x08` 只落在腿上 —— 代价不对称，忽略它的最坏结果是继续走，采信它的是断扭矩、鸭子摔 | `is_transient_alarm` |
 | **C** | 试探失败后 `dropped_at` 已是 `Some`，`misses` 继续涨但**不再打日志**，且 200 永远留在读表里、每轮白等满 12 ms | `imu.rs:366`（`wants_block`）+ `record_miss` 里的 `first` 判据 |
 | **D** | 主循环把锁死的旧消息以 50 Hz 重放——「11 万次」就是这么来的，很误导人 | `main.rs:2005` |
 | **E** | 小板一掉线，`read()` 就失败，`consecutive_errors` 照涨（2026-10-16 拔板测试里爬到 1810+ 再自己归零）——**跟 B/D 是同一个坑**：那个数字不是总线诊断。好在这条会自愈，不锁存 | `feetech.rs:576` + `main.rs:2000` |
@@ -594,5 +556,45 @@ unit 名字就写着 `MicroDuck HD1910 native runtime and APK backend`。
 `claim_control` 决定唯一控制者；每条命令带 `_time`，**超过 300 ms 丢弃 = 死手开关**（app 卡住或断网自动停）。
 
 > **`clear_fault` 就是 app 上那个「复位故障」按钮**（[main.rs:221](microduck_app/backend/src/main.rs#L221)），
-> 转给 robotd 的正是不久前把总线锁死的 `robot.clear_fault`（7.4 节）。**打开 motion 之后这条路通了**
+> 转给 robotd 的正是不久前把总线锁死的 `robot.clear_fault`（7.2 节）。**打开 motion 之后这条路通了**
 > —— `set_torque(false)` 不再被拒，所以那个死锁自己解开了，以后遇到故障按它有效，不用重启服务。
+
+## 9: 待办 —— 装了摄像头之后跑 `mediad`
+
+**触发条件：给鸭子装上摄像头（`/dev/video*` 出现）。在那之前不做。**
+
+`mediad` 是上游 workspace 里的一个 Rust 守护进程（[microduck/mediad/](microduck/mediad/)），
+摄像 + 麦克风 + WebRTC。它**没编、也没装到这台板子上** —— [scripts/build.sh:15](scripts/build.sh#L15)
+只编 `-p robotd -p robotctl`。这是故意的，不是漏了。
+
+它提供什么：
+
+| | |
+|---|---|
+| `http://<robot>:8080/` | **控制台网页**（`--web-port`，默认 8080）—— 就是之前记得的那个 8080 |
+| `<robot>:8443` | WebRTC 信令（`--port`，默认 8443） |
+| 网页里 | 摄像头画面 + 一条 `control` 数据通道直通机器人 API，**浏览器里就能遥控鸭子** |
+| 配置 | `robotd.toml` 的 `[media]` / `[detect]` 两节，跟 robotd 读同一个文件 |
+
+**现在不做，是因为这三条：**
+
+1. **板上没有摄像头** —— `/dev/video*` 不存在，它最主要的那一半是空的
+2. **缺 `webrtcsink` 插件** —— GStreamer 1.26.2 在（它要求 ≥1.22），但这个插件要从
+   gst-plugins-rs 自己编；交叉编译还得用 `scripts/cross-sysroot.sh` 那套 sysroot，
+   整个 workspace 都跟着它
+3. **它不鉴权** —— 源码原话：「Anyone who reaches the signalling port can drive the robot and
+   see its camera」，而且默认绑 `0.0.0.0`
+
+**装好摄像头之后要做的（顺序别反）：**
+
+1. 先确认 `/dev/video0` 出得来、`v4l2-ctl --list-formats-ext` 能看到格式
+2. 编 `webrtcsink`（gst-plugins-rs，版本跟板上 1.26.2 对齐）
+3. `cargo build -p mediad`，加进 `scripts/build.sh` 的 `-p` 列表，并补一个 systemd unit
+4. `robotd.toml` 里配 `[media]`（camera / 分辨率 / 帧率 / 码率）
+5. 上板验证：`http://<board>:8080/` 能开、能出画面、网页里的 control 能驱动
+6. **鉴权没有就是没有** —— 只在内网用，别直接暴露到公网
+
+它自己写着「**不在恢复路径上**」：mediad 起不来，鸭子照走、照能更新、照样能用蓝牙。
+所以它坏了随时停掉就行，不影响控制。
+
+参考：`microduck/docs/design/remote-webrtc.md`、`microduck/docs/design/webrtc-console.md`。
