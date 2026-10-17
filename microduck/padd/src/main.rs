@@ -25,7 +25,7 @@
 //! a thing and answers with the list it does have when it does not.
 //!
 //! ```text
-//! Start        toggle the policy
+//! Start        tap: toggle the policy · hold 2 s: release joint power (the robot goes limp)
 //! Y (North)    head mode — sticks pose the head
 //! B (East)     body-pose mode — sticks lean and crouch the standing robot
 //! A (South)    ground pick
@@ -181,6 +181,14 @@ const IDLE_POLL: Duration = Duration::from_millis(500);
 /// Select held this long sits the robot down and powers it off.
 const SHUTDOWN_HOLD: Duration = Duration::from_secs(2);
 
+/// Start held this long releases joint power instead of toggling the policy.
+///
+/// Two seconds, the same hold as Select, so the two are the same gesture in the hand —
+/// Select sits the robot down first, Start drops it where it stands. The toggle waits for
+/// the *release*: acting on the press edge would toggle first and then relax at two seconds,
+/// so a hold would move the robot for its whole length just before going limp.
+const RELAX_HOLD: Duration = Duration::from_secs(2);
+
 /// D-pad up held this long switches drive mode, walk ⇄ roller.
 ///
 /// Three seconds, longer than the shutdown hold, and the prototype's number. D-pad up is a
@@ -308,8 +316,8 @@ fn main() -> std::process::ExitCode {
         socket = %args.socket.display(),
         hz = args.hz,
         roller,
-        "driving — Start toggles the policy, Y head mode, B body pose, A ground pick, \
-         LB/RB kicks, DPad-Down sit, triggers mouth, DPad-Up (3s) walk/roller, \
+        "driving — Start taps the policy (hold 2s relaxes), Y head mode, B body pose, \
+         A ground pick, LB/RB kicks, DPad-Down sit, triggers mouth, DPad-Up (3s) walk/roller, \
          Select (2s) shutdown"
     );
 
@@ -329,6 +337,10 @@ fn main() -> std::process::ExitCode {
     let mut driving = false;
     let mut select_held_since: Option<Instant> = None;
     let mut dpad_up_held_since: Option<Instant> = None;
+    // Start: held long enough to relax, and whether this hold already did. The toggle fires
+    // on release, so both are cleared together there.
+    let mut start_held_since: Option<Instant> = None;
+    let mut relax_sent = false;
     let mut mode_switch_sent = false;
     let mut shutdown_sent = false;
     // Trigger levels last tick, for the sound edges: RT quacks on its rising edge, LT
@@ -358,7 +370,6 @@ fn main() -> std::process::ExitCode {
 
         // Drain the queue so axis polling below sees present state, and catch button
         // *edges* — a held Start must toggle once, not fifty times a second.
-        let mut toggle_enable = false;
         let mut toggle_head = false;
         let mut toggle_body = false;
         // Which bindable buttons went down this tick, by their config name. A list rather than
@@ -367,7 +378,8 @@ fn main() -> std::process::ExitCode {
         while let Some(event) = gilrs.next_event() {
             if let gilrs::EventType::ButtonPressed(button, _) = event.event {
                 match button {
-                    Button::Start => toggle_enable = true,
+                    // Start is not an edge: a tap toggles the policy and a two-second hold
+                    // relaxes, so it is handled by press/release duration below.
                     Button::North => toggle_head = true,
                     Button::East => toggle_body = true,
                     // The five bindable ones. What each runs is `[pad]` in the config; this
@@ -444,30 +456,65 @@ fn main() -> std::process::ExitCode {
             }
         }
 
-        if toggle_enable {
-            // The robot owns the toggle. A local on/off belief here drifts from the
-            // robot's the moment anything else moves it — robot.relax, the shutdown
-            // sequence, either side restarting — and a stale belief turns Start into a
-            // button that does nothing every other press. `toggle` flips the robot's own
-            // state; turning OFF returns it to the home pose (the prototype's "returning
-            // to default pose"), so turning on always starts the policy from home.
-            let call = proto::Call::RobotEnable(proto::EnableParams {
-                on: false,
-                toggle: true,
-            });
-            match request(&mut stream, &mut next_id, &call) {
-                Err(e) => {
-                    tracing::error!(error = %e, "enable failed");
-                    return std::process::ExitCode::FAILURE;
+        // Start: a tap toggles the policy, a two-second hold releases joint power.
+        //
+        // Both halves key off the press/release pair rather than the press edge: the toggle
+        // has to wait for the release, or a hold would toggle first and then relax at two
+        // seconds — moving the robot for the length of the hold just before going limp.
+        if pad.is_pressed(Button::Start) {
+            let held = start_held_since.get_or_insert(tick);
+            if tick.duration_since(*held) >= RELAX_HOLD && !relax_sent {
+                relax_sent = true;
+                tracing::warn!(
+                    "Start held — releasing joint power; the robot goes limp where it stands"
+                );
+                match request(&mut stream, &mut next_id, &proto::Call::RobotRelax) {
+                    Err(e) => {
+                        tracing::error!(error = %e, "relax failed");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                    Ok(response) => {
+                        let outcome = response
+                            .and_then(|r| r.result_as::<proto::IntentResult>().ok())
+                            .and_then(|r| r.reason)
+                            .unwrap_or_else(|| "relaxed".to_owned());
+                        tracing::warn!(%outcome, "relax");
+                    }
                 }
-                Ok(response) => {
-                    // The robot names the state it ended in; that is the log, since padd
-                    // no longer has a belief of its own to report.
-                    let outcome = response
-                        .and_then(|r| r.result_as::<proto::IntentResult>().ok())
-                        .and_then(|r| r.reason)
-                        .unwrap_or_else(|| "toggled".to_owned());
-                    tracing::warn!(%outcome, "policy");
+            }
+        } else {
+            // Released. A tap toggles; a hold already did its work and does nothing here.
+            let pressed_at = start_held_since.take();
+            let was_relax = relax_sent;
+            relax_sent = false;
+            if let Some(pressed_at) = pressed_at
+                && !was_relax
+                && tick.duration_since(pressed_at) < RELAX_HOLD
+            {
+                // The robot owns the toggle. A local on/off belief here drifts from the
+                // robot's the moment anything else moves it — robot.relax, the shutdown
+                // sequence, either side restarting — and a stale belief turns Start into a
+                // button that does nothing every other press. `toggle` flips the robot's own
+                // state; turning OFF returns it to the home pose (the prototype's "returning
+                // to default pose"), so turning on always starts the policy from home.
+                let call = proto::Call::RobotEnable(proto::EnableParams {
+                    on: false,
+                    toggle: true,
+                });
+                match request(&mut stream, &mut next_id, &call) {
+                    Err(e) => {
+                        tracing::error!(error = %e, "enable failed");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                    Ok(response) => {
+                        // The robot names the state it ended in; that is the log, since padd
+                        // no longer has a belief of its own to report.
+                        let outcome = response
+                            .and_then(|r| r.result_as::<proto::IntentResult>().ok())
+                            .and_then(|r| r.reason)
+                            .unwrap_or_else(|| "toggled".to_owned());
+                        tracing::warn!(%outcome, "policy");
+                    }
                 }
             }
         }

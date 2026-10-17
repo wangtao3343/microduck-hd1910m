@@ -153,7 +153,7 @@ WARN robotd: waiting for native Feetech/BNO085; startup reads only
 |---|---|---|---|
 | `robotd` | 控制循环 / 舵机 / IMU / 策略 | **跑着** | **必需**，没它鸭子就是块铁 |
 | `microduck-app-server`（`microduck_app/`） | 手机 app 后端，绑 `0.0.0.0:38880` | **跑着**（同一个 unit 里起） | 要用手机 app 就要 |
-| `padd` | 手柄意图客户端（`gilrs`） | 没装 | **加手柄时要它** |
+| `padd` | 手柄意图客户端（`gilrs`） | **跑着**（2026-10-17 起） | **加手柄时要它** |
 | `btd` | 蓝牙 BLE 传输适配 | 没装 | 手机走 LAN 就不用；走蓝牙才要 |
 | `configd` | 配 wifi / 身份 | 没装 | 现在是手改配置文件，不用 |
 | `tofd` | 头上 ToF 传感器 | 没装 | 有 ToF 硬件才要 |
@@ -163,9 +163,12 @@ WARN robotd: waiting for native Feetech/BNO085; startup reads only
 **让鸭子走路，只需要 `robotd`。** 其余全是可选的，缺了不影响它走。
 
 unit 文件在各组件自己的 `systemd/` 下（`microduck/{btd,configd,padd,tof,mediad,updater}/systemd/`）。
-`padd` 和 `mediad` 都带 C 依赖（`gilrs`→`libudev`、GStreamer），交叉编译得先把
-`scripts/cross-sysroot.sh` 那套 sysroot 跑起来；而 `scripts/build.sh` 目前只编
-`-p robotd -p robotctl`，其余二进制**从来没生成过**。
+`scripts/build.sh` 只编 `-p robotd -p robotctl`（外加 app-server）；`padd` 单独编（见 §6.5），
+`btd` / `configd` / `tofd` / `mediad` / `updaterd` **从来没生成过**。
+
+板上另外有两个非仓内工具（2026-10-17 装）：
+`padd.service`（手柄，单元在 `microduck/padd/systemd/padd-runtime.service`）和
+`bt-watch.service`（蓝牙活体记录，脚本在 `tools/bt-watch/`，卡死时把现场落到 `/var/log/bt-watch/`）。
 
 ## 5: 关节的正负方向（`direction`）
 
@@ -284,7 +287,12 @@ unit 文件在各组件自己的 `systemd/` 下（`microduck/{btd,configd,padd,t
 `Config` 是 `deny_unknown_fields`，所以**先送新二进制，再加配置项**。反过来 robotd 会直接拒绝加载配置，整个运行时起不来。
 
 ```bash
+# 开发机：cargo 不在默认 PATH 里，先 export —— 否则 build.sh 第 15 行报
+# `cargo: command not found`。每个新 shell 都要来一次。
+export PATH="$HOME/.cargo/bin:$PATH"
+
 # 开发机：交叉编译（只有 robotd/robotctl 变了，app-server 没动）
+# 产物：out/arm64/bin/{robotd,robotctl,microduck-app-server}
 bash scripts/build.sh arm64
 
 # 板上：备份 → 停 → 送。配置先不动，确认新二进制本身没毛病
@@ -307,6 +315,29 @@ systemctl restart microduck-hd1910
 **`--chown=duck:duck` 不能省**：以 root 直接 rsync 会把二进制写成 root 属主，而服务是 duck 跑的。
 
 回退：`mv robotd.bak-20261013 robotd` + 删掉那一格 + 重启。
+
+**`build.sh` 只编 `robotd` / `robotctl` / `microduck-app-server`。** `padd`（手柄）带 C 依赖，
+要单独编 —— 先 export sysroot（做法见 `手柄连接.md`「编 padd」）：
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+cd ~/microduck-hd1910m/microduck
+export PKG_CONFIG_SYSROOT_DIR=/home/ai/arm64-sysroot
+export PKG_CONFIG_PATH=/home/ai/arm64-sysroot/usr/lib/aarch64-linux-gnu/pkgconfig
+export PKG_CONFIG_ALLOW_CROSS=1
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+cargo build --release --locked --target aarch64-unknown-linux-gnu -p padd
+# 产物：target/aarch64-unknown-linux-gnu/release/padd
+# 放进 out/arm64/bin —— build.sh 不管 padd，deploy.py 又只搬 out/arm64，
+# 少了这一步板上会缺 padd
+install -m755 target/aarch64-unknown-linux-gnu/release/padd ../out/arm64/bin/
+scp ../out/arm64/bin/padd root@192.168.3.10:/tmp/padd.new
+ssh root@192.168.3.10 'install -o duck -g duck -m0755 /tmp/padd.new \
+      /home/duck/workspace/microduck-hd1910m/out/arm64/bin/padd && systemctl restart padd'
+```
+
+链接时的 `libcap.so.2 … not found` 无害，板上运行时解析。
+`cargo test -p padd` 在开发机上跑不起来（本机没装 x86_64 的 `libudev-dev`），不是代码问题。
 
 ### 6.6 验收（2026-10-15 实测）
 

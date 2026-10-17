@@ -1,0 +1,18 @@
+# bt-watch —— 记录 AIC8800 蓝牙的活体信息，卡死时留下现场。
+#
+# 装到 /etc/systemd/system/bt-watch.service，配套脚本放 /usr/local/sbin/bt-watch.sh。
+# 它只读 /proc、/sys 和 hciconfig 的 ioctl，不发 HCI 命令，不碰机器人。
+
+[Unit]
+Description=AIC8800 bluetooth liveness recorder
+Documentation=file:///home/duck/workspace/microduck-hd1910m/手柄连接.md
+After=bluetooth.service multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/bt-watch.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

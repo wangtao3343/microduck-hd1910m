@@ -1,0 +1,41 @@
+# padd —— 板上 runtime 部署用的单元（不是 /opt/robot 那套）。
+#
+# 装到 /etc/systemd/system/padd.service。
+# 与同目录的 padd.service 的区别只在部署形态：那套用 User=padd / Group=robot、
+# 二进制在 /opt/robot/daemon/current/bin；我们这套跑在 duck 用户的 workspace 下，
+# robotd 的 socket 也在 local/，所以路径全部显式写死。
+#
+# 没有手柄时它什么都不发（robotd 的 deadman 自己压着），所以常驻是安全的；
+# 手柄连上后一个 tick 内就会被它接住。
+
+[Unit]
+Description=MicroDuck gamepad intent client (padd)
+# robotd 是 intent 的去处，先起它没意义；但它没起来时也不能把 padd 卡死 ——
+# padd 连不上 socket 会退出，靠下面的 Restart=always 五秒后重试，慢启动也能追上。
+After=microduck-hd1910.service bluetooth.service
+Wants=microduck-hd1910.service
+
+[Service]
+Type=exec
+User=duck
+SupplementaryGroups=input
+
+WorkingDirectory=/home/duck/workspace/microduck-hd1910m
+# socket 必须显式指：padd 默认找 /run/robotd.sock，我们这套 runtime 不用那个路径。
+ExecStart=/home/duck/workspace/microduck-hd1910m/out/arm64/bin/padd \
+    --socket /home/duck/workspace/microduck-hd1910m/local/robotd.sock
+
+Restart=always
+RestartSec=5s
+
+# /run/padd/ 是 padd 自己的目录：identity.json 给 robotctl health 读，
+# pad.sock 是 robotctl monitor 用的原始输入 tap。不给它会在启动时抱怨一句。
+RuntimeDirectory=padd
+RuntimeDirectoryMode=0755
+
+Environment=RUST_LOG=info
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
