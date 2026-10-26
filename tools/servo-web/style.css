@@ -103,6 +103,25 @@
   td, th { border-bottom:1px solid var(--line); padding:3px 6px; text-align:left; }
   td.n { text-align:right; }
   .area-EEPROM { color:var(--warn); } .area-SRAM { color:var(--acc); } .area-反馈 { color:var(--muted); }
+  /* 刚度表：EEPROM 21/22/23 和 SRAM 50/51/52 并排，中间一条竖线分开。
+     左边只读（灰的），右边 P/D/I 是可写的输入框，一眼看出「写的是谁」。
+     右栏只有 min(520px,40%) 宽，十列塞不下 —— 挤紧到能放下，再窄就在表里横向滚，
+     不然最后一列「写」会被切掉（2026-10-26 就是这样看不见的）。 */
+  #gainTbl { margin-top:8px; overflow-x:auto; }
+  #gainTbl table { font-size:11px; font-variant-numeric:tabular-nums; border-collapse:separate; border-spacing:0; }
+  #gainTbl thead th { padding:3px 5px; font-size:11px; font-weight:600; color:var(--muted); white-space:nowrap; text-align:center; border-bottom:1px solid var(--line); }
+  #gainTbl thead tr:first-child th { letter-spacing:.05em; text-transform:uppercase; }
+  #gainTbl thead th:first-child, #gainTbl thead th:nth-child(2) { text-align:left; }
+  #gainTbl tbody td { padding:1px 5px; text-align:center; }
+  #gainTbl tbody td:first-child, #gainTbl tbody td:nth-child(2) { text-align:left; }
+  #gainTbl tbody td:nth-child(2) { max-width:104px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #gainTbl tbody tr + tr td { border-top:1px solid rgba(36,48,41,.55); }
+  #gainTbl tbody tr:hover td { background:rgba(61,240,163,.06); }
+  #gainTbl .gz-sram { border-left:1px solid var(--line); }   /* 两组之间的那条竖线 */
+  #gainTbl td.gz-eeprom { color:var(--muted); }
+  #gainTbl td.gz-tq-on { color:var(--warn); }
+  #gainTbl input[type=number] { width:42px; padding:1px 3px; text-align:center; }
+  #gainTbl button { padding:1px 7px; font-size:11px; }
   .bad { color:var(--bad); } .muted { color:var(--muted); }
   #dumpWrap { max-height:420px; overflow:auto; }
   /* 躯干姿态整块从右栏搬到 3D 画布上，浮在左上角，不占画布外的地方。

@@ -37,7 +37,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # 调试台版本。改了前端或后端就加一：app.js 里的 PAGE_VERSION 要跟这里一样，
 # 页面连上后会比对，不一样就提示"页面是旧的，Ctrl+F5"。改动记在 README 的「版本」一节。
-VERSION = "0.16.10"
+VERSION = "0.16.11"
 # 本机（microduck-hd1910m）的舵机编号：右腿 1–5、左腿 6–10、头颈 11–15。
 # 映射的权威来源是仓库根的 radxa/installation.json（robotd 读的就是它）；
 # 关节顺序跟原项目一样是「左腿 → 颈/头/嘴 → 右腿」，只有编号不同。
@@ -1152,6 +1152,61 @@ def do_scan(ids):
     return found
 
 
+# ---- 刚度 P/D ----
+# 跑起来用的是 SRAM 的 50/51，掉电就回到 EEPROM 的 21/22。只看 21/22 会误判：
+# 出厂 32，运行时被写软了照样显示 32。Luwu 官方 Arduino 运行时写的是 6/20，嘴单独 10
+# （xgoduck_runtime_arduino/sketch/duck_config.h 的 TEMP_KP_RUN / TEMP_KD_RUN / TEMP_KP_MOUTH）。
+GAIN_P, GAIN_D, GAIN_I = 50, 51, 52          # SRAM：控制环真正用的
+GAIN_EEPROM = (21, 22, 23)                  # EEPROM：上电时抄进 50/51/52 的那一份
+GAIN_MOUTH_ID = 15
+GAIN_REFERENCE = {"p": 6, "d": 20, "mouth_p": 10}
+
+
+def read_gains(ids=None):
+    """每颗读一圈：EEPROM 的上电默认 P/D/I（21/22/23）、正在跑的 P/D/I（50/51/52）、扭矩开关。
+    单颗读失败只标这颗，不中断。"""
+    rows = []
+    for sid in (ids or PRESENT or IDS):
+        row = {"id": sid, "joint": JOINT_NAMES.get(sid)}
+        try:
+            row["eeprom_p"] = BUS.read_u8(sid, GAIN_EEPROM[0])
+            row["eeprom_d"] = BUS.read_u8(sid, GAIN_EEPROM[1])
+            row["eeprom_i"] = BUS.read_u8(sid, GAIN_EEPROM[2])
+            row["p"] = BUS.read_u8(sid, GAIN_P)
+            row["d"] = BUS.read_u8(sid, GAIN_D)
+            row["i"] = BUS.read_u8(sid, GAIN_I)
+            row["torque"] = BUS.read_u8(sid, 40)
+        except feetech.BusError as exc:
+            row["error"] = str(exc)
+        rows.append(row)
+    return {"type": "gains", "rows": rows}
+
+
+def write_gains(ids, p, d, mouth_p=0, i=None):
+    """写运行期 P/D（50/51）；给了 i 就连 52 一起写，没给就不碰 I。
+    全部是 SRAM 写，不解锁 EEPROM。写完逐颗回读比对。"""
+    targets = ids or PRESENT or IDS
+    for sid in targets:
+        kp = mouth_p if (sid == GAIN_MOUTH_ID and mouth_p) else p
+        try:
+            old = [BUS.read_u8(sid, GAIN_P), BUS.read_u8(sid, GAIN_D), BUS.read_u8(sid, GAIN_I)]
+            BUS.write_u8(sid, GAIN_P, kp)
+            BUS.write_u8(sid, GAIN_D, d)
+            if i is not None:
+                BUS.write_u8(sid, GAIN_I, i)
+            want = [kp, d] if i is None else [kp, d, i]
+            new = [BUS.read_u8(sid, GAIN_P), BUS.read_u8(sid, GAIN_D), BUS.read_u8(sid, GAIN_I)]
+            ok = new[:len(want)] == want
+            fmt = lambda v: "/".join(str(x) for x in v)
+            log(f"#{sid}「{JOINT_NAMES.get(sid, '?')}」运行 P/D/I {fmt(old)} → {fmt(want)}，读回 {fmt(new)}"
+                + ("" if ok else "（读回跟写的不一样：这颗不接受这些地址，或者被别的程序抢了总线）"),
+                "刚度", "info" if ok else "warn")
+        except feetech.BusError as exc:
+            log(f"#{sid} 写运行 P/D 失败：{exc}", "刚度", "error")
+    return read_gains()
+
+
+
 def do_timing(n=200):
     """sync_read 全部在线舵机 n 次，看耗时和失败。"""
     ids = PRESENT or IDS
@@ -1339,6 +1394,14 @@ def handle(cmd):
         log(f"#{sid} 写 {addr}「{name}」{old} → {val}{_ack(err)}，读回 {new}" + ("（解锁写入，已重新加锁）" if unlock else "")
             + ("" if same else "（读回跟写的不一样：只读？超范围？扭矩开关写 128 这类命令值本来就读不回）"),
             "寄存器", "info" if same else "warn")
+    elif op == "gains":
+        return read_gains([int(i) for i in cmd.get("ids") or []] or None)
+    elif op == "write_gains":
+        # 只写 SRAM 50/51（给了 i 再写 52），不解锁、不落 EEPROM：物理上不可逆的只有 EEPROM，这里没有。
+        i = cmd.get("i")
+        return write_gains([int(x) for x in cmd.get("ids") or []] or None,
+                           int(cmd["p"]), int(cmd["d"]), int(cmd.get("mouth_p") or 0),
+                           None if i is None or i == "" else int(i))
     elif op == "reboot":
         sid = int(cmd["id"])
         BUS.write_u8(sid, 40, 0)

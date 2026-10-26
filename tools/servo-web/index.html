@@ -62,6 +62,7 @@
       <div id="tabBar" role="tablist">
         <button type="button" class="tab on" data-tab="pose" onclick="showTab('pose')">官方姿势</button>
         <button type="button" class="tab" data-tab="calib" onclick="showTab('calib')">校准</button>
+        <button type="button" class="tab" data-tab="gain" onclick="showTab('gain')">刚度</button>
         <button type="button" class="tab" data-tab="log" onclick="showTab('log')">日志 <span id="logWarn" class="badge" style="color:var(--warn);display:none"></span><span id="logErr" class="badge" style="color:var(--bad);display:none"></span></button>
       </div>
       <div id="tabBody">
@@ -153,6 +154,29 @@
           <section id="dumpSec" hidden>
             <h2>寄存器 <span id="dumpId"></span> <button onclick="downloadDump()">下载 JSON</button> <button onclick="copyDumpMd()">复制 Markdown 表</button></h2>
             <div id="dumpWrap"><table id="dumpTbl"></table></div>
+          </section>
+        </div>
+        <div class="tabPane" id="tabGain" hidden>
+          <section>
+            <h2>刚度 P/D <span class="muted" style="font-weight:400">写的是 50/51（运行值），不是 21/22</span></h2>
+            <details class="muted" style="font-size:12px;line-height:1.7">
+              <summary style="cursor:pointer">六个地址分别是什么，上电时发生了什么</summary>
+              舵机里同一组 PID 存两份，<b>六个地址</b>：<br>
+              <b>21 / 22 / 23</b>（EEPROM，P/D/I）＝ 上电时被抄走的那一份，掉电不丢，<b>只读显示</b>；<br>
+              <b>50 / 51 / 52</b>（SRAM，P/D/I）＝ 控制环真正在用的那一份，掉电就没了，<b>「写」写的就是这三个地址</b>（I 那一格留空就不写 I，官方运行值里 I 是 0）。<br>
+              <b>上电时序</b>：舵机上电那一刻，固件把 21/22/23 抄进 50/51/52，之后控制环只认 50/51/52。所以 21=32 的话，上电后 50 就是 32；改了 21 在断电之前对运行没有任何影响。<br>
+              官方运行值是 <b>P=6 / D=20</b>，嘴单独 <b>P=10</b>。robotd 每次上电都会直接写 50/51 这一组，所以这里改的只对 servo-web 手操有效，<b>重启 robotd 会被覆盖回 6/20</b>。每颗写完都回读比对。
+            </details>
+            <div class="row">
+              <button onclick="readGains()">读全部</button>
+              P <input type="number" id="gainP" value="6" min="1" max="254" style="width:56px">
+              D <input type="number" id="gainD" value="20" min="1" max="254" style="width:56px">
+              I <input type="number" id="gainI" value="0" min="0" max="254" style="width:56px" title="留空就不写 I（52）">
+              嘴P <input type="number" id="gainMouthP" value="10" min="1" max="254" style="width:56px">
+              <button class="danger" onclick="writeAllGains()">写到全部</button>
+              <button onclick="loadReferenceGains()">填官方运行值</button>
+            </div>
+            <div id="gainTbl"><span class="muted">还没读。点「读全部」或者切到这一页会自动读一次。</span></div>
           </section>
         </div>
         <div class="tabPane" id="tabLog" hidden>

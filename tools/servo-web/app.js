@@ -1,8 +1,8 @@
 // 跟 server.py 的 VERSION 一起改。连上后比对，不一致说明浏览器拿的是旧页面
-const PAGE_VERSION = "0.16.10";
+const PAGE_VERSION = "0.16.11";
 const $ = id => document.getElementById(id);
 const v = id => Number($(id).value);
-let ws, names = {}, present = [], ids = [], lastDump = null, sendTimer = {}, lastSent = {};
+let ws, names = {}, present = [], ids = [], lastDump = null, gainRows = [], sendTimer = {}, lastSent = {};
 const rawPos = {}, goalPos = {};
 let dirs = {};   // 每颗 +1 / -1，来自服务端 directions.json，所有页面共用
 let isServoDemo = false;
@@ -42,6 +42,7 @@ function connect() {
     else if (m.type === 'state') update(m.states, m.stats);
     else if (m.type === 'scan') { present = m.present; build(); }
     else if (m.type === 'dump') showDump(m);
+    else if (m.type === 'gains') showGains(m);
     else if (m.type === 'timing') { $('timing').textContent = `n=${m.n} ids=${m.ids} min ${m.min_ms} ms · avg ${m.avg_ms} ms · p99 ${m.p99_ms} ms · max ${m.max_ms} ms · 失败 ${m.fails}`; }
     else if (m.type === 'logs') m.items.forEach(pushLog);
     else if (m.type === 'error') hint('出错：' + m.msg + '（详情看日志）');
@@ -83,10 +84,12 @@ function reconnect() {
 let hintTimer;
 // 右侧浮层的三个 tab：官方姿势 / 校准 / 日志。纯显示开关 —— 切走的那块只是 hidden，
 // 里面的滑块、日志、幽灵表照常由各自的老代码管，连读带写都不受影响。
-const TABS = { pose: 'tabPose', calib: 'tabCalib', log: 'tabLog' };
+const TABS = { pose: 'tabPose', calib: 'tabCalib', gain: 'tabGain', log: 'tabLog' };
 function showTab(name) {
   for (const k in TABS) $(TABS[k]).hidden = (k !== name);
   document.querySelectorAll('#tabBar .tab').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
+  // 刚度页一进来先读一次：默认值看着像 32，实际在跑的不是它，不读就没意义
+  if (name === 'gain' && !gainRows.length) readGains();
 }
 
 function hint(text) { const h = $('hint'); h.textContent = text; h.classList.add('show'); clearTimeout(hintTimer); hintTimer = setTimeout(() => h.classList.remove('show'), 5000); }
@@ -450,6 +453,57 @@ function copyDumpMd() {
   if (!lastDump) return;
   const md = ['| 地址 | 名称 | 区 | 值 |', '|---|---|---|---|', ...lastDump.rows.map(r => `| ${r.addr} | ${r.name} | ${r.area} | ${r.value} |`)].join('\n');
   navigator.clipboard.writeText(md).then(() => addLog('已复制 Markdown 表'));
+}
+// ---- 刚度 P/D ----
+// 跑起来用的是 SRAM 50/51，EEPROM 21/22 只是上电默认值（出厂 32）。只看 21/22 会误判成「舵机是硬的」。
+// 官方运行值 P=6 / D=20、嘴 P=10（xgoduck_runtime_arduino/sketch/duck_config.h）。
+function readGains() { send({ op: 'gains' }); }
+function loadReferenceGains() { $('gainP').value = 6; $('gainD').value = 20; $('gainI').value = 0; $('gainMouthP').value = 10; }
+// I 留空就不写 52（官方运行值也不动 I）
+const gainIValue = input => input.value === '' ? null : Number(input.value);
+function writeAllGains() {
+  const p = v('gainP'), d = v('gainD'), mouth = v('gainMouthP'), i = gainIValue($('gainI'));
+  if (!(p > 0 && d > 0)) { hint('P、D 都要大于 0'); return; }
+  const torqued = gainRows.filter(r => !r.error && r.torque).map(r => r.id);
+  const n = gainRows.filter(r => !r.error).length || present.length;
+  if (!confirm(`把 ${n} 颗的运行 P/D 写成 ${p}/${d}（嘴 ${mouth}）${i === null ? '，I 不动' : `，I 写成 ${i}`}？\n`
+    + (torqued.length ? `注意：ID ${torqued.join(',')} 扭矩开着，改刚度会当场抖一下。\n` : '')
+    + '只写 SRAM 50/51/52，不解锁 EEPROM；给舵机断一次电就回到上电默认。')) return;
+  send({ op: 'write_gains', p, d, mouth_p: mouth, i });
+}
+function writeOneGain(id) {
+  const p = v('gp' + id), d = v('gd' + id), i = gainIValue($('gi' + id));
+  if (!(p > 0 && d > 0)) { hint(`ID ${id} 的 P、D 都要大于 0`); return; }
+  if (!confirm(`只写 ID ${id}（${names[id] || '非标准 ID'}）：运行 P/D ${p}/${d}${i === null ? '，I 不动' : `，I ${i}`}？`)) return;
+  send({ op: 'write_gains', ids: [id], p, d, i });
+}
+function showGains(m) {
+  const rank = id => { const k = ORDER.indexOf(id); return k < 0 ? 999 : k; };
+  gainRows = (m.rows || []).slice().sort((a, b) => rank(a.id) - rank(b.id) || a.id - b.id);
+  const t = $('gainTbl');
+  if (!gainRows.length) { t.innerHTML = '<span class="muted">总线上没读到舵机：先回「校准」页扫描一下。</span>'; return; }
+  const ok = gainRows.filter(r => !r.error);
+  const torqued = ok.filter(r => r.torque);
+  t.innerHTML =
+    (torqued.length ? `<div class="bad" style="font-size:12px;margin-bottom:6px">ID ${torqued.map(r => r.id).join(',')} 扭矩开着：这时候改 P/D 会当场抖一下，建议先关扭矩再调。</div>` : '')
+    + '<table>'
+    + '<thead><tr>'
+    + '<th rowspan="2">ID</th><th rowspan="2">关节</th>'
+    + '<th colspan="3">上电默认 · EEPROM</th>'
+    + '<th colspan="3" class="gz-sram">运行值 · SRAM</th>'
+    + '<th rowspan="2">扭矩</th><th rowspan="2"></th>'
+    + '</tr><tr><th>21 P</th><th>22 D</th><th>23 I</th>'
+    + '<th class="gz-sram">50 P</th><th>51 D</th><th>52 I</th></tr></thead><tbody>'
+    + gainRows.map(r => r.error
+      ? `<tr><td class="n">${r.id}</td><td>${r.joint || ''}</td><td colspan="7" class="bad">${r.error}</td></tr>`
+      : `<tr><td class="n">${r.id}</td><td class="muted">${r.joint || ''}</td>`
+        + `<td class="n gz-eeprom">${r.eeprom_p}</td><td class="n gz-eeprom">${r.eeprom_d}</td><td class="n gz-eeprom">${r.eeprom_i}</td>`
+        + `<td class="n gz-sram"><input type="number" id="gp${r.id}" value="${r.p}" min="1" max="254"></td>`
+        + `<td class="n"><input type="number" id="gd${r.id}" value="${r.d}" min="1" max="254"></td>`
+        + `<td class="n"><input type="number" id="gi${r.id}" value="${r.i}" min="0" max="254" title="留空就不写这一颗的 I"></td>`
+        + `<td class="n${r.torque ? ' gz-tq-on' : ' muted'}">${r.torque ? '开' : '关'}</td>`
+        + `<td><button onclick="writeOneGain(${r.id})" title="只写 ID ${r.id} 这一颗的运行 P/D/I">写</button></td></tr>`).join('')
+    + '</tbody></table>';
 }
 // robotd.toml 的 [bus.feetech] directions：关节顺序是左腿 6–10、颈头嘴 11–15、右腿 1–5
 function copyRobotdDirs() {
