@@ -94,8 +94,25 @@ out/arm64/bin/microduck-app-server   ← 后端 API，绑 0.0.0.0:38880
 out/arm64/bin/robotctl               ← 命令行工具，经 Unix socket 跟 robotd 说话，按需跑
 ```
 
-策略是 `radxa/references/reference_runtime_20261005/` 里那四个 ONNX：**walk / getup / pick / roulade**。
+仓库默认的策略集是 `radxa/references/reference_runtime_20261005/` 里那四个 ONNX：**walk / getup / pick / roulade**。
 `.venv` 在板上唯一的用途是提供 `libonnxruntime.so`（见 `scripts/run_hardware.sh`）。
+
+### 4.1.1 板上现在跑的是 kissqy 那套（2026-10-28）
+
+2026-10-27/28 把 walk、ground_pick、roulade 三张图换成了 kissqy 上游的（`radxa/references/kissqy_20261027/`）。
+四图契约、IO、控制回路一行没动，**recovery 仍是参考集的 `hd1910_getup.onnx`**（kissqy 那套没有起身图）。
+
+- **为什么换 walk**：kissqy walk 有约 0.2 m/s 的死区 —— 仿真与真机一致，vx=0.1 原地抖腿、vx=0.3 才走到 0.18/0.30 m/s。手柄满杆约 0.298，正好压在工作点上；参考版 0.15 就切小步态，所以手感上一开始反而是 kissqy 更像「推杆才走」。
+- **运行时要配合的两处**（已随 `replica` 分支提交）：`duck-control/src/policy.rs` 的 `load_reference` 哈希白名单给 walk / pick / roulade 各多认一个 kissqy 哈希，recovery 仍只认一个；新增 `policy.ground_pick_end_phase` 键（未设时 `reference_native` 仍是 1.0，kissqy pick 要 0.7 —— 4 s 周期里 2.8 s，与其 manifest 的 `duration_s` 一致），`robotd/src/main.rs` 的 reference 契约检查相应放宽到 roulade 1.9|1.0 s、end_phase 1.0|0.7。
+- **回滚**：板上备份 `local/params.toml.bak-pre-kissqy-pick-roulade`、`out/arm64/bin/robotd.bak-20261027-pre-kissqy-skills`；或 `sudo robotctl policy reset`（会把槽全恢复成配置里的 reference）。
+
+三个坑：
+
+1. **`radxa/reference_native.toml` 和 `scripts/configure.py` 仍指 reference 集**。再跑一次配置/部署，板上的 walk / pick / roulade 会被改回参考版，今天的改动全白搭 —— 和 `feetech.json` 那次串口默认值同一个性质。
+2. **stand / sitstand / kick_left 存着但加载不了**。`reference_native` 这个 profile 只吃 walk / 拾取 / 起身 / roulade 四个角色，而且要求 stand / sitstand 缺席。要跑那三张得换 profile，会连带改 IMU 滤波、速度滤波和目标钳位，不是换文件的事。
+3. **别照上游 `README.md` 里的 0.9 / 0.5 / 0.7 设**。这批包的 `deployment-profile.toml` 和 manifest 都写死 `action_scale = 1.0`、`head_lowpass = 1.0`、`legs_lowpass = 1.0`；README 里那组数是他们自己固件里槽位的配置，不是这个导出的契约。
+
+另外两件实测到的事：**观测里没有躯干速度**（`obs.rs` 的 61 维只有陀螺、重力、关节角速度、上一帧动作和指令），所以策略看不见自己在不在动 —— 很滑的地面上脚底打滑、身体不前进，它没有任何信号可纠正，表现出来就是碎步，调参数解决不了；而 kissqy walk 训练时脚底摩擦只随机化到 `(0.7, 1.3)`（注释写明 `Grippier footpad — narrowed from (0.3, 1.2)`），滑地本来就在分布外。
 
 ### 4.2 部署哪些
 
