@@ -646,10 +646,14 @@ pub struct PolicyParams {
     pub head_lowpass: Option<f64>,
     /// Same, for the ten leg joints. Walking default 0.7.
     pub legs_lowpass: Option<f64>,
-    /// One ground-pick cycle, seconds. The move ends at the set's `end_phase` (70% of the
-    /// cycle, as the prototype does). Absent resolves from the installed set's phase-encoded
-    /// entry for this mode, else 4.0 walking, 3.0 roller (the crouch).
+    /// One ground-pick cycle, seconds. The move ends at `ground_pick_end_phase` (70% of the
+    /// cycle by default, as the prototype does). Absent resolves from the installed set's
+    /// phase-encoded entry for this mode, else 4.0 walking, 3.0 roller (the crouch).
     pub ground_pick_period: Option<f64>,
+    /// Fraction of the cycle at which the ground pick hands back. Absent keeps the published
+    /// reference's full cycle (1.0), which replays the reach on the way out; a graph trained on
+    /// the prototype's 2.8 s window wants 0.7.
+    pub ground_pick_end_phase: Option<f64>,
     /// Action scale while the ground pick runs. Absent: the set's entry, else 1.0 walking,
     /// 0.8 roller.
     pub ground_pick_action_scale: Option<f64>,
@@ -1433,9 +1437,18 @@ impl PolicyParams {
                     Mode::Walk => 4.0,
                     Mode::Roller => 3.0,
                 }),
-            ground_pick_end_phase: if self.reference_native { 1.0 } else { pick
-                .map(|t| t.end_phase)
-                .unwrap_or(DEFAULT_GROUND_PICK_END_PHASE) },
+            // `reference_native` used to pin this to 1.0 outright. The shipped reference
+            // pick does replay its whole cycle, but a graph trained on the prototype's
+            // shorter window needs the 0.7 cutoff — so an explicit value wins, and the
+            // unset default still resolves to 1.0 in the reference profile.
+            ground_pick_end_phase: self
+                .ground_pick_end_phase
+                .or(pick.map(|t| t.end_phase))
+                .unwrap_or(if self.reference_native {
+                    1.0
+                } else {
+                    DEFAULT_GROUND_PICK_END_PHASE
+                }),
             ground_pick_action_scale: self
                 .ground_pick_action_scale
                 .or(pick.and_then(|t| t.action_scale))
@@ -1533,6 +1546,7 @@ impl Default for PolicyParams {
             head_lowpass: None,
             legs_lowpass: None,
             ground_pick_period: None,
+            ground_pick_end_phase: None,
             ground_pick_action_scale: None,
             ground_pick_gain_ratio: 1.0,
             skills: Vec::new(),
@@ -2055,8 +2069,43 @@ mod tests {
         assert_eq!(tuned.ground_pick_action_scale, 0.7);
         assert_eq!(
             tuned.ground_pick_end_phase, 0.7,
-            "there is no key for the cutoff"
+            "unset, so the crouch entry's own cutoff"
         );
+    }
+
+    /// **The cutoff has a key too, and it beats both the set and the reference default.** A
+    /// retrained pick is trained on its own window, so the cut has to be settable without a
+    /// daemon release — the same reason the period has one.
+    #[test]
+    fn a_config_key_sets_the_ground_pick_cutoff() {
+        let set = published_set();
+        let tuned = super::PolicyParams {
+            ground_pick_end_phase: Some(0.62),
+            ..Default::default()
+        }
+        .resolved_with(Some(&set));
+        assert_eq!(tuned.ground_pick_end_phase, 0.62);
+    }
+
+    /// **`reference_native` still hands back at the end of the cycle unless told otherwise.** The
+    /// shipped reference pick replays its reach, so 1.0 stays the profile's default; only an
+    /// explicit value moves it.
+    #[test]
+    fn reference_native_keeps_the_full_cycle_unless_cut() {
+        let reference = super::PolicyParams {
+            reference_native: true,
+            ..Default::default()
+        }
+        .resolved_with(None);
+        assert_eq!(reference.ground_pick_end_phase, 1.0);
+
+        let cut = super::PolicyParams {
+            reference_native: true,
+            ground_pick_end_phase: Some(0.7),
+            ..Default::default()
+        }
+        .resolved_with(None);
+        assert_eq!(cut.ground_pick_end_phase, 0.7);
     }
 
     /// **The set says how the sit↔stand is timed.** The rise was a literal second and the

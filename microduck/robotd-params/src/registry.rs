@@ -196,6 +196,11 @@ pub const REGISTRY: &[Entry] = &[
         "One ground-pick cycle, seconds; unset resolves per mode",
     ),
     entry(
+        "policy.ground_pick_end_phase",
+        Kind::OptionalFloat,
+        "Cycle fraction the ground pick hands back at; unset is 1.0",
+    ),
+    entry(
         "policy.ground_pick_action_scale",
         Kind::OptionalFloat,
         "Action scale during the ground pick; unset resolves per mode",

@@ -453,11 +453,34 @@ impl Policy {
         ensure_runtime()?;
         catching_ort_panics(|| {
             let files = [&paths.walk, pick, &paths.skills[0], &paths.skills[1]];
-            let hashes = [
-                "5727b909d5ea1a0f9ff63bf4cea9707339dea6a522374c7a120da633605b923f",
-                "f34e990dda785e9a8c53890bdcd0f7f1d457592691fd3703f3776b48fb2d14b8",
-                "c414f2bd84b0a79b89f0ba6997135eb45e4ecd9df9271ea989c237864027b2a3",
-                "8adb1e6bc3f5eef751ce4edbf940f6d5a25fdec3ec4a798e1d9ca135c8248e97",
+            // Walk, pick and roulade each accept a second graph: the kissqy set
+            // this board rehearses (2026-10-27). Recovery stays pinned — it is the
+            // fall get-up, and a mismatched graph there is what the contract exists
+            // to catch.
+            let hashes: [&[&str]; 4] = [
+                &[
+                    // Shipped reference walk (reference_runtime_20261005).
+                    "5727b909d5ea1a0f9ff63bf4cea9707339dea6a522374c7a120da633605b923f",
+                    // kissqy upstream `firmware/policies/walk/policy.onnx`
+                    // (velstand 2026-10-07 model_9599), added 2026-10-27 to
+                    // rehearse it on this duck.
+                    "1cbf8730eadd75a5704332c9f3c10f60bfa9412135b907831c9dbd731ce1795f",
+                ],
+                &[
+                    // Shipped reference pick.
+                    "f34e990dda785e9a8c53890bdcd0f7f1d457592691fd3703f3776b48fb2d14b8",
+                    // kissqy upstream `firmware/policies/ground_pick/policy.onnx`,
+                    // added 2026-10-27 with the walk swap. Trained on the 2.8 s
+                    // window, so a board running it wants `ground_pick_end_phase`.
+                    "b14e3a8b56ddbb8d2d831e727774a168c8f5b00194e3e431ae7593a840498c69",
+                ],
+                &["c414f2bd84b0a79b89f0ba6997135eb45e4ecd9df9271ea989c237864027b2a3"],
+                &[
+                    // Shipped reference roulade.
+                    "8adb1e6bc3f5eef751ce4edbf940f6d5a25fdec3ec4a798e1d9ca135c8248e97",
+                    // kissqy upstream `firmware/policies/roulade/policy.onnx`.
+                    "59e15d7b04d0c40e9b11b8a70bdecae6da87a5e096efc204fb58eea304fcbbac",
+                ],
             ];
             let names = crate::model::JOINT_NAMES.iter().enumerate()
                 .filter(|(i, _)| *i != crate::model::MOUTH_INDEX).map(|(_, n)| *n).collect::<Vec<_>>().join(",");
@@ -466,7 +489,7 @@ impl Policy {
             for (path, hash) in files.into_iter().zip(hashes) {
                 let bytes = std::fs::read(path).map_err(|e| PolicyError::Inference(e.to_string()))?;
                 let digest = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect::<String>();
-                if digest != hash {
+                if !hash.contains(&digest.as_str()) {
                     return Err(PolicyError::Inference(format!("Reference role/hash mismatch: {}", path.display())));
                 }
                 let mut session = open(path)?;

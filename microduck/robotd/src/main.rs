@@ -1636,9 +1636,13 @@ fn try_controller(
                 || policy_cfg.skills.len() != 2
                 || policy_cfg.skills[0].name != "recovery" || policy_cfg.skills[1].name != "roulade"
                 || (policy_cfg.skills[0].duration - 13.0).abs() > 1e-6
-                || (policy_cfg.skills[1].duration - 1.9).abs() > 1e-6
+                // The published reference roulade runs 1.9 s; the kissqy graph is the
+                // 1.0 s one the upstream firmware ships (2026-10-27 swap).
+                || ![1.9, 1.0].iter().any(|d| (policy_cfg.skills[1].duration - d).abs() <= 1e-6)
                 || (policy_cfg.ground_pick_period - 4.0).abs() > 1e-6
-                || (policy_cfg.ground_pick_end_phase - 1.0).abs() > 1e-6
+                // Reference pick replays its whole cycle (1.0); the kissqy pick is
+                // trained on the phase command's 0.7 cutoff of the same 4 s cycle.
+                || ![1.0, 0.7].iter().any(|p| (policy_cfg.ground_pick_end_phase - p).abs() <= 1e-6)
                 || policy_cfg.ground_pick_action_scale != 1.0 || policy_cfg.ground_pick_gain_ratio != 1.0
                 || policy_cfg.skills.iter().any(|s| s.chain || s.unwind_s != 0.0 || s.command != [0.0;3]
                     || s.params.action_scale.is_some_and(|v| v != 1.0)
