@@ -495,6 +495,10 @@ def replay(args):
     cases=transition_cases() if continuous else replay_cases(args.extended, getattr(args, 'curve_cases', False))
     required_cases=len(cases)
     if args.case!='all': cases=[c for c in cases if c[0]==args.case]
+    if getattr(args, 'case_lin_vel_x', None) is not None:
+        if not math.isfinite(args.case_lin_vel_x):
+            raise ValueError('case forward command must be finite')
+        cases=[(name, (args.case_lin_vel_x, cmd[1], cmd[2])) for name, cmd in cases]
     rng=np.random.default_rng(args.seed)
     rows=[]
     args.report.parent.mkdir(parents=True,exist_ok=True)
@@ -831,6 +835,10 @@ def main():
     p.add_argument('--initial-tilt-deg',type=float,default=0.)
     p.add_argument('--seed',type=int,default=42)
     p.add_argument('--case',choices=('all','stand','forward','turn','backward','turn_right'),default='all')
+    p.add_argument('--case-lin-vel-x',type=float,default=None,
+                   help='Override the selected case forward command (m/s). The built-in forward '
+                        'case is 0.1, which sits below the ~0.2 m/s deadband of the upstream '
+                        'walk policies: they stand still and look broken. Use 0.3 to see a gait.')
     p.add_argument('--extended',action='store_true',help='Also evaluate backward motion and negative yaw')
     p.add_argument('--transition-test',action='store_true',help='Keep simulation and action history across move/stop stages')
     p.add_argument('--curve-cases', action='store_true', help='Also test forward/reverse turning together')
