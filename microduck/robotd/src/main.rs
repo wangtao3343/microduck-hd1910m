@@ -46,7 +46,7 @@ use duck_ipc_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use control::{Controller, Driving, SkillTuning, Tuning};
+use control::{Controller, Driving, GETUP_SKILL, SkillTuning, Tuning};
 use intents::Intents;
 use params::{Mode, Params, Slot};
 
@@ -131,6 +131,21 @@ const RESET_AFTER_PAUSE: Duration = Duration::from_millis(200);
 /// Mean leg-joint deviation from the home pose above which a boot counts as seated —
 /// hips and knees folded far from standing. The prototype's threshold.
 const SEATED_BOOT_RAD: f64 = 0.30;
+
+/// Whether the robot is off its feet: more than 45° from upright, by projected gravity.
+///
+/// `Safety::fallen` is not this test. It is the *fall verdict* — debounced, and true only of
+/// a robot substantially upside down — while a duck lying on its side reads as upright there
+/// (projected gravity near zero) and is exactly the robot a linear ramp to the home pose
+/// must not be given. 45° is the angle at which "it will stand up by itself" stops being
+/// true of a duck with a policy and starts needing the getup network.
+fn tipped_over(gravity: &[f64; 3]) -> bool {
+    // Normalised, and not merely read, because an orientation filter that has not converged
+    // reports a zero vector — which would divide to "0 < 0.707" and send a standing robot
+    // through the getup network. Same guard the policy itself uses.
+    let norm = gravity.iter().map(|v| v * v).sum::<f64>().sqrt();
+    norm > 0.5 && -gravity[2] / norm < std::f64::consts::FRAC_1_SQRT_2
+}
 
 /// Where the limp-fall sequence is (`[safety] limp_fall`).
 ///
@@ -1840,6 +1855,9 @@ async fn control_loop<T: RobotIo>(
     let mut window_ticks = 0u64;
     let mut last_summary = Instant::now();
     let mut was_driving = false;
+    // Whether a scripted move was running the networks last tick, independent of the walk
+    // policy. The two are separate because a getup runs on a robot whose policy is stopped.
+    let mut was_scripted = false;
     let mut bringup = Bringup::Limp;
     // A mode switch in flight: the mode to end up in, once the robot is home. `None` the rest of
     // the time, which is nearly always.
@@ -2075,6 +2093,16 @@ async fn control_loop<T: RobotIo>(
                                 .expect("checked above")
                                 .begin_boot_rise();
                             bringup = Bringup::Ready;
+                        } else if tipped_over(&sensors.imu.gravity)
+                            && controller
+                                .as_mut()
+                                .is_some_and(|c| c.begin_getup().is_ok())
+                        {
+                            // Same reason as the enable path: a robot on the floor is
+                            // brought up by the getup network, not by an interpolation to a
+                            // pose it would have to be dragged through the floor to reach.
+                            tracing::warn!("robot.init: downed — rising via the getup policy");
+                            bringup = Bringup::Ready;
                         } else {
                             tracing::warn!(?HOME_RAMP, "robot.init: torque on, ramping to home");
                             bringup = Bringup::Homing {
@@ -2115,13 +2143,40 @@ async fn control_loop<T: RobotIo>(
             None => {}
         }
 
-        // One-shot skill requests, taken once per tick like the power request. They need a
-        // driving robot — the prototype's buttons likewise did nothing until the policy ran.
+        // One-shot skill requests, taken once per tick like the power request.
+        //
+        // They used to need a driving robot, and that refused the one request that matters
+        // most: a duck on the floor cannot be handed the walk policy, so the getup that would
+        // right it could only ever be asked for after the robot had already stood up. The
+        // intent side allows exactly that one skill with the policy stopped; here torque comes
+        // on *where the robot lies* — no home ramp, which is the scramble this exists to
+        // replace — and the network runs from the pose it is actually in.
         let requests = intents.take_skills();
         if requests.any() {
+            if !snapshot.enabled
+                && bringup == Bringup::Limp
+                && shutdown_sit.is_none()
+                && !powered_off
+                && controller.is_some()
+            {
+                match safety.set_torque(true) {
+                    Ok(()) => {
+                        tracing::warn!("getup with torque off — torque on where the robot lies");
+                        bringup = Bringup::Ready;
+                        // A stale action in the observation and a filter anchored where the
+                        // robot was before it went down are both a lurch on the first frame.
+                        if let Some(controller) = controller.as_mut() {
+                            controller.reset();
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "cannot enable torque; the getup is dropped")
+                    }
+                }
+            }
             match controller.as_mut() {
                 Some(controller)
-                    if snapshot.enabled && bringup == Bringup::Ready && shutdown_sit.is_none() =>
+                    if bringup == Bringup::Ready && shutdown_sit.is_none() && !powered_off =>
                 {
                     let outcome = |what: &str, result: Result<(), &'static str>| match result {
                         Ok(()) => tracing::warn!(skill = what, "skill started"),
@@ -2154,7 +2209,7 @@ async fn control_loop<T: RobotIo>(
                         }
                     }
                 }
-                _ => tracing::info!("skill request ignored: the policy is not driving"),
+                _ => tracing::info!("skill request ignored: the robot is not ready to run one"),
             }
         }
 
@@ -2577,6 +2632,18 @@ async fn control_loop<T: RobotIo>(
                             .expect("checked above")
                             .begin_boot_rise();
                         bringup = Bringup::Ready;
+                    } else if tipped_over(&sensors.imu.gravity)
+                        && controller
+                            .as_mut()
+                            .is_some_and(|c| c.begin_getup().is_ok())
+                    {
+                        // Down, not seated: the ramp would drag the robot through the floor
+                        // on its way to home and hand the walker one that is still
+                        // scrambling. The getup network ends itself once the robot has been
+                        // upright for a second, and the walker takes over from there — which
+                        // is the same hand-off the seated boot gets from sitstand.
+                        tracing::warn!("downed — rising via the getup policy");
+                        bringup = Bringup::Ready;
                     } else {
                         tracing::warn!(
                             ?HOME_RAMP,
@@ -2820,7 +2887,37 @@ async fn control_loop<T: RobotIo>(
         let mut scripted_mouth = None;
         let mut policy_step_ok = true;
         let mut inference = None;
-        let (mut targets, gain, moving, policy_label) = match (driving, sensors.as_ref()) {
+        // A scripted move is its own reason to run the networks. `driving` is the walk
+        // policy's gate, and a getup asked for on a robot whose policy is stopped would never
+        // pass it — so the skill would be "started" and then never stepped.
+        let scripted = controller.as_ref().is_some_and(Controller::busy)
+            && bringup == Bringup::Ready
+            && sensors.is_some()
+            && imu_warm
+            && !in_limp_fall
+            && shutdown_sit.is_none()
+            && !powered_off;
+        if was_scripted && !scripted {
+            // A scripted move just ended, and whatever comes next is judged against `hold` unless
+            // the walker takes over — which, with the policy enabled but no task requested yet,
+            // it does not. `hold` still carries the pose from before the move, and for a getup
+            // that pose is the floor; commanding the robot back down what it has just climbed off
+            // is the one wrong answer available here.
+            //
+            // Measured, not the network's last target: the network's last command is not
+            // necessarily where the joints arrived, and a hold anchored to a pose the robot is
+            // not in is an error the motors spend the next second pushing against.
+            if let Some(sensors) = sensors.as_ref() {
+                hold = sensors.positions;
+            } else if !snapshot.enabled {
+                // No sample to say where it ended. A robot nobody enabled may be left standing
+                // at home, which is where a getup that succeeded ends; one that is driving will
+                // get its pose from the walker anyway.
+                hold = home;
+            }
+        }
+        was_scripted = scripted;
+        let (mut targets, gain, moving, policy_label) = match (driving || scripted, sensors.as_ref()) {
             // The limp-fall sequence, before anything else — `driving` is false throughout,
             // so without this it would fall through to the hold branch and the robot would
             // be commanded its pre-fall pose at walking gain, which is precisely the thing
@@ -4188,16 +4285,25 @@ fn dispatch(
             // Not refused for being down. A skill on a fallen robot is the human's call, and
             // refusing it is how a robot ends up unable to do the thing that would have
             // righted it.
+            //
+            // Which is why the getup is the one name taken with the policy stopped: the only
+            // way to start the policy from the floor is the very ramp that falls back over,
+            // so "press Start first" made recovery unreachable exactly when it was needed.
+            // Everything else still starts from standing and still needs the policy driving.
+            //
             // Refused before the name is even looked at, because "accepted" followed by
-            // nothing is the worst answer available: the loop drops a skill request whenever
-            // the policy is not driving, and it says so only in the journal. That silence cost
-            // an evening once already.
-            let result = if !intents.enabled() {
+            // nothing is the worst answer available: a request the loop cannot act on is
+            // otherwise silent. That silence cost an evening once already.
+            let enabled = intents.enabled();
+            let result = if !enabled && p.skill != GETUP_SKILL {
                 // Only the pad can start the policy: `robotctl robot` has `init` and `relax`
                 // and no `enable`, so naming a command here would be naming one that does not
                 // exist.
-                proto::IntentResult::refused("the policy is not driving — press Start on the pad")
-            } else if !state.homed.load(Ordering::Relaxed) {
+                proto::IntentResult::refused(format!(
+                    "the policy is not driving — press Start on the pad; only {GETUP_SKILL} runs \
+                     with it stopped"
+                ))
+            } else if enabled && !state.homed.load(Ordering::Relaxed) {
                 proto::IntentResult::refused(
                     "the robot is still going to its home pose; try again in a moment",
                 )
@@ -7223,15 +7329,17 @@ mod tests {
         );
     }
 
-    /// **A skill asked for while the policy is not driving is refused, not accepted.**
+    /// **A skill asked for while the policy is not driving is refused, not accepted — the
+    /// getup excepted.**
     ///
-    /// The loop drops a skill request unless `enabled` and homed, and said so only in the
+    /// The loop drops a skill request unless it is ready to run one, and said so only in the
     /// journal — so the answer to a client was "accepted" followed by a robot that did nothing.
     /// That is the same silence that made a policy load look broken earlier, and it is worth a
     /// sentence rather than a log line nobody is tailing.
     ///
     /// The message names the pad and nothing else, because nothing else can start the policy:
-    /// `robotctl robot` has `init` and `relax` and no `enable`.
+    /// `robotctl robot` has `init` and `relax` and no `enable`. Recovery is the exception —
+    /// see the test below it.
     #[test]
     fn a_skill_before_start_is_refused_with_what_to_do() {
         let s = RobotState::new(
@@ -7257,6 +7365,68 @@ mod tests {
         let reason = result.reason.unwrap();
         assert!(reason.contains("Start"), "{reason}");
         assert_eq!(intents.take_skills().skills, 0, "and nothing was queued");
+    }
+
+    /// **A robot on its side is tipped over; a robot on a bench is not; a cold IMU is not.**
+    ///
+    /// The middle case is why this is not `Safety::fallen`: that verdict needs the robot
+    /// substantially upside down, and a duck lying on its side passes it as upright. The last
+    /// is why it normalises: an unconverged filter reports zero, and zero would otherwise
+    /// read as sideways and send a standing robot through the getup network.
+    #[test]
+    fn tipped_over_is_about_attitude_and_not_a_cold_filter() {
+        let upright = [0.0, 0.0, -1.0];
+        assert!(!tipped_over(&upright));
+        assert!(tipped_over(&[1.0, 0.0, 0.0]), "on its side");
+        assert!(tipped_over(&[0.0, 0.0, 1.0]), "upside down");
+        assert!(!tipped_over(&[0.0, 0.0, 0.0]), "unconverged filter");
+
+        let thirty = std::f64::consts::FRAC_PI_6;
+        assert!(!tipped_over(&[thirty.sin(), 0.0, -thirty.cos()]));
+        let sixty = std::f64::consts::FRAC_PI_3;
+        assert!(tipped_over(&[sixty.sin(), 0.0, -sixty.cos()]));
+    }
+
+    /// **Recovery is the exception: it is taken with the policy stopped.**
+    ///
+    /// It is the one skill that starts from the floor, and the only way to start the policy
+    /// from the floor is the ramp that falls the robot over again — so requiring Start here
+    /// made the getup unreachable exactly when somebody needed it. Queuing it is all this
+    /// side does; the loop powers the joints where the robot lies and runs the network.
+    #[test]
+    fn the_getup_is_accepted_with_the_policy_stopped() {
+        let s = RobotState::new(
+            &Params::default(),
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        s.policies.store(std::sync::Arc::new(PolicyNames {
+            walk: Some("walk.onnx".to_owned()),
+            stand: None,
+            sitstand: None,
+            ground_pick: None,
+            skills: vec!["recovery".to_owned(), "roulade".to_owned()],
+        }));
+        let intents = Arc::new(Intents::new());
+
+        let result: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotDo(proto::DoParams {
+                skill: "recovery".into(),
+            }),
+        )
+        .result_as()
+        .unwrap();
+
+        assert!(result.accepted, "{:?}", result.reason);
+        assert_eq!(
+            intents.take_skills().skills,
+            1,
+            "queued at index 0, which is bit 0 of the shifted mask"
+        );
     }
 
     /// Enabled but still ramping home is its own answer — it resolves on its own in a second,

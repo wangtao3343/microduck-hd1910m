@@ -33,6 +33,7 @@
 //! DPad-Down    sit ↔ stand
 //! RT / LT      mouth (either trigger; the max wins) · RT quacks · LT rides the wheee
 //! Select, 2 s  sit down, then power off
+//! DPad-Left, 2 s  clear a latched servo fault (all joint power goes off)
 //! ```
 //!
 //! Head and body-pose mode both zero the velocity while active, as the prototype does — a
@@ -86,6 +87,8 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use duck_ipc_proto as proto;
+#[cfg(target_os = "linux")]
+use gilrs::LinuxGamepadExt;
 use gilrs::{Axis, Button, Gilrs};
 
 #[cfg(target_os = "linux")]
@@ -195,6 +198,17 @@ const RELAX_HOLD: Duration = Duration::from_secs(2);
 /// direction anybody might lean on for a moment while driving; the mode switch takes the robot
 /// home and reloads its policies, so it has to be a hold nobody performs by accident.
 const MODE_HOLD: Duration = Duration::from_secs(3);
+
+/// D-pad left held this long clears a latched servo fault.
+///
+/// A latched alarm — `0x04` heat or `0x08` over-current, the two that are never retried — stops
+/// the whole bus: every read returns that one error, the policy holds, and Start stops doing
+/// anything at all. Without this the pad can only drive a robot that has to be recovered from the
+/// phone, which is the one thing the pad exists to avoid.
+///
+/// **It cuts all joint power**, which is why it is a two-second hold on a direction nobody drives
+/// with rather than a tap: the robot goes limp where it stands.
+const FAULT_CLEAR_HOLD: Duration = Duration::from_secs(2);
 
 /// Body-pose stick ranges, from the training env via the prototype: z is asymmetric
 /// (little headroom up at the standing height, more crouch down), angles capped at ~15°.
@@ -318,7 +332,7 @@ fn main() -> std::process::ExitCode {
         roller,
         "driving — Start taps the policy (hold 2s relaxes), Y head mode, B body pose, \
          A ground pick, LB/RB kicks, DPad-Down sit, triggers mouth, DPad-Up (3s) walk/roller, \
-         Select (2s) shutdown"
+         DPad-Left (2s) clear fault, Select (2s) shutdown"
     );
 
     let period = Duration::from_secs_f64(1.0 / args.hz as f64);
@@ -335,14 +349,20 @@ fn main() -> std::process::ExitCode {
     let mut mode = Mode::Drive;
     // Whether a pad was there last tick, so appearing and disappearing are each logged once.
     let mut driving = false;
+    // Which axes carry the right stick, and the pad that answer belongs to. Asked again when
+    // a different pad connects: the same model can come back with another layout.
+    let mut right_stick = (Axis::RightStickX, Axis::RightStickY);
+    let mut right_stick_for: Option<gilrs::GamepadId> = None;
     let mut select_held_since: Option<Instant> = None;
     let mut dpad_up_held_since: Option<Instant> = None;
+    let mut dpad_left_held_since: Option<Instant> = None;
     // Start: held long enough to relax, and whether this hold already did. The toggle fires
     // on release, so both are cleared together there.
     let mut start_held_since: Option<Instant> = None;
     let mut relax_sent = false;
     let mut mode_switch_sent = false;
     let mut shutdown_sent = false;
+    let mut fault_clear_sent = false;
     // Trigger levels last tick, for the sound edges: RT quacks on its rising edge, LT
     // starts the wheee ride. The prototype's threshold.
     let mut prev_rt = 0.0f64;
@@ -420,6 +440,21 @@ fn main() -> std::process::ExitCode {
         if !driving {
             tracing::warn!(pad = pad.name(), "pad connected — driving");
             driving = true;
+        }
+
+        // Which axes this pad's right stick is on — see [`right_stick_axes`]. Asked once per
+        // pad rather than per tick: the answer is a capability mask that only changes when a
+        // different device connects, and the journal line is the one place that says which
+        // layout is actually driving.
+        if right_stick_for != Some(pad.id()) {
+            right_stick = right_stick_axes(&pad);
+            tracing::warn!(
+                pad = pad.name(),
+                x = ?right_stick.0,
+                y = ?right_stick.1,
+                "right-stick axes"
+            );
+            right_stick_for = Some(pad.id());
         }
 
         // Every tick rather than on the transition above: a pad that drops and comes back between
@@ -624,14 +659,43 @@ fn main() -> std::process::ExitCode {
             mode_switch_sent = false;
         }
 
+        // D-pad left held two seconds: clear a latched servo fault — the same `robot.clear_fault`
+        // the phone's fault-reset button sends. Refused when nothing is latched, which is the
+        // common case; the robot's own reason is the log either way.
+        if pad.is_pressed(Button::DPadLeft) {
+            let held = dpad_left_held_since.get_or_insert(tick);
+            if tick.duration_since(*held) >= FAULT_CLEAR_HOLD && !fault_clear_sent {
+                fault_clear_sent = true;
+                tracing::warn!(
+                    "DPad-Left held — clearing a latched fault; all joint power goes off"
+                );
+                match request(&mut stream, &mut next_id, &proto::Call::RobotClearFault) {
+                    Err(e) => {
+                        tracing::error!(error = %e, "fault clear failed");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                    Ok(response) => {
+                        let outcome = response
+                            .and_then(|r| r.result_as::<proto::IntentResult>().ok())
+                            .and_then(|r| r.reason)
+                            .unwrap_or_else(|| "no answer".to_owned());
+                        tracing::warn!(%outcome, "fault clear");
+                    }
+                }
+            }
+        } else {
+            dpad_left_held_since = None;
+            fault_clear_sent = false;
+        }
+
         let deadzone = |v: f32| {
             let v = v as f64;
             if v.abs() < args.deadzone { 0.0 } else { v }
         };
         let left_x = deadzone(pad.value(Axis::LeftStickX));
         let left_y = deadzone(pad.value(Axis::LeftStickY));
-        let right_x = deadzone(pad.value(Axis::RightStickX));
-        let right_y = deadzone(pad.value(Axis::RightStickY));
+        let right_x = deadzone(pad.value(right_stick.0));
+        let right_y = deadzone(pad.value(right_stick.1));
 
         // Either trigger opens the mouth; the max wins, as in the prototype — where RT
         // also chirps and LT rides the wheee, which they now do here too.
@@ -841,6 +905,50 @@ impl Continuous {
         });
         !asks_for_motion && self.at.is_some_and(|at| now.duration_since(at) < HEARTBEAT)
     }
+}
+
+/// The two axes this pad's right stick is really on.
+///
+/// gilrs knows no SDL mapping for every pad, and its built-in fallback assumes the standard
+/// layout: left stick on `ABS_X`/`ABS_Y`, right stick on `ABS_RX`/`ABS_RY`. The GameSir Nova 2
+/// Lite over Bluetooth declares neither `ABS_RX` nor `ABS_RY`: its right stick reports on
+/// `ABS_Z`/`ABS_RZ`, and the analogue triggers are the *named* `ABS_GAS`/`ABS_BRAKE` pair. Under
+/// the fallback those two arrive as `LeftZ`/`RightZ`, `Axis::RightStick*` reads 0 forever, and
+/// the stick looks dead — no turning while walking, no head roll or pitch in head mode.
+///
+/// Decided from what the device declares, once per pad, rather than from which axes happen to
+/// be reporting: a pad with real right-stick axes keeps them, and one with a secondary Z/RZ pair
+/// *plus* named triggers has its right stick there. Sampling values instead — "the axes resting
+/// near centre are the stick" — would swap the sticks the first time a trigger came to rest at
+/// half travel.
+#[cfg(target_os = "linux")]
+fn right_stick_axes(pad: &gilrs::Gamepad<'_>) -> (Axis, Axis) {
+    use evdev::AbsoluteAxisCode;
+
+    const STANDARD: (Axis, Axis) = (Axis::RightStickX, Axis::RightStickY);
+
+    let Ok(device) = evdev::Device::open(pad.devpath()) else {
+        return STANDARD;
+    };
+    let Some(axes) = device.supported_absolute_axes() else {
+        return STANDARD;
+    };
+    let has = |code: AbsoluteAxisCode| axes.contains(code);
+
+    let standard_stick = has(AbsoluteAxisCode::ABS_RX) && has(AbsoluteAxisCode::ABS_RY);
+    let named_triggers = has(AbsoluteAxisCode::ABS_GAS) && has(AbsoluteAxisCode::ABS_BRAKE);
+    let secondary_stick = has(AbsoluteAxisCode::ABS_Z) && has(AbsoluteAxisCode::ABS_RZ);
+    if !standard_stick && named_triggers && secondary_stick {
+        // Where gilrs's fallback can be read back from: `ABS_Z` is mapped to `LeftZ` and
+        // `ABS_RZ` to `RightZ`.
+        return (Axis::LeftZ, Axis::RightZ);
+    }
+    STANDARD
+}
+
+#[cfg(not(target_os = "linux"))]
+fn right_stick_axes(_pad: &gilrs::Gamepad<'_>) -> (Axis, Axis) {
+    (Axis::RightStickX, Axis::RightStickY)
 }
 
 /// Send a discrete intent and read its answer.

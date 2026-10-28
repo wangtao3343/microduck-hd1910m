@@ -48,6 +48,13 @@ const HEAD_JOINTS: std::ops::Range<usize> = 5..9;
 /// dropped packet, far too short to mistake a fresh press for a hold.
 const CHAIN_WINDOW: f64 = 0.15;
 
+/// The one skill that makes sense on a robot that is not standing.
+///
+/// It is the name the reference contract gives its getup network, and it is also what the
+/// intent side refuses *everything else* against when the policy is stopped: a robot on the
+/// floor can be asked to get up, not to pick something off it.
+pub const GETUP_SKILL: &str = "recovery";
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tuning {
     /// Scales raw policy output before it becomes a joint offset. The prototype's current
@@ -431,6 +438,32 @@ impl Controller {
         Ok(true)
     }
 
+    /// The index of this robot's getup skill, if it has one.
+    ///
+    /// Found by name, not by position. The reference contract happens to put recovery first,
+    /// and [`Self::step`] already relies on that for the upright test — but a robot whose
+    /// config orders its skills differently must not have the wrong network handed a robot
+    /// lying on the floor.
+    fn getup_index(&self) -> Option<usize> {
+        self.skill_names().iter().position(|name| name == GETUP_SKILL)
+    }
+
+    /// Torque has just come on with the robot not standing: put the getup network in charge
+    /// instead of the linear ramp to home.
+    ///
+    /// The ramp interpolates *through* whatever pose the robot is in, which for a duck lying
+    /// down means dragging folded legs across the floor and handing the walker a robot still
+    /// mid-scramble — observed on a board as "it tries to stand up and falls over". The getup
+    /// network is the thing trained for that pose; it ends itself once the robot has been
+    /// upright for a second, and the walker takes over from there.
+    ///
+    /// `Err` means this robot has no getup skill, which is not a failure: the caller falls
+    /// back to the ramp, which is what it did before this existed.
+    pub fn begin_getup(&mut self) -> Result<(), &'static str> {
+        let index = self.getup_index().ok_or("no getup skill on this robot")?;
+        self.start_skill(index).map(|_| ())
+    }
+
     pub fn cancel_manual_step(&mut self) {
         if self.policy.is_reference() {
             if !self.busy() { return; }
@@ -508,7 +541,12 @@ impl Controller {
                     if active.upright_s >= 1.0 {
                         self.active = None;
                     } else if active.remaining <= 0.0 {
-                        return Err(PolicyError::Inference("recovery timed out; stop task before retry".into()));
+                        // Cleared before the error, and the error is the point: left in
+                        // place, the same timeout came back every tick — an inference
+                        // failure fifty times a second, on a robot that was not going to
+                        // stand up either way. One report and the robot holds where it is.
+                        self.active = None;
+                        return Err(PolicyError::Inference("recovery timed out; the robot stays where it is".into()));
                     }
                 }
             }
