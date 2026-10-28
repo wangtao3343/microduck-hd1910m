@@ -135,17 +135,25 @@ def value_at(acc, tag, step=None):
     return None
 
 
-def checkpoints(logs_dir):
-    """Every model_*.pt across all runs of this experiment, ordered by iteration."""
+def checkpoints(logs_dir, run_dir=None):
+    """Every model_*.pt ordered by iteration; `run_dir` keeps it to the run being watched.
+
+    Without the filter, an older run's model_1250.pt in the same logs tree reads as
+    "the latest checkpoint" while the live run is still at iteration 74.
+    """
     out = []
-    for p in glob.glob(os.path.join(logs_dir, 'rsl_rl', '*', '*', 'model_*.pt')):
+    if run_dir:
+        pattern = os.path.join(run_dir, 'model_*.pt')
+    else:
+        pattern = os.path.join(logs_dir, 'rsl_rl', '*', '*', 'model_*.pt')
+    for p in glob.glob(pattern):
         m = re.search(r'model_(\d+)\.pt$', p)
         if m:
             out.append((int(m.group(1)), p, os.path.getmtime(p)))
     return sorted(out)
 
 
-def training_alive(needle='.venv/bin/train'):
+def training_alive(needles=('.venv/bin/train', 'scripts/train_hd1910.py')):
     """Trainer processes, so a dead run does not look like a paused one."""
     alive = []
     for pid in os.listdir('/proc'):
@@ -156,7 +164,7 @@ def training_alive(needle='.venv/bin/train'):
                 cmd = fh.read().replace(b'\0', b' ').decode(errors='replace')
         except OSError:
             continue
-        if needle in cmd:
+        if any(n in cmd for n in needles):
             elapsed = time.time() - os.stat(f'/proc/{pid}').st_mtime
             alive.append(f'pid {pid} · {elapsed / 60:.0f} 分钟')
     return alive
@@ -271,7 +279,7 @@ def render(logs_dir, target, scale=2):
     else:
         lines.append('  （还在热身，速度待测量）')
 
-    ckpts = checkpoints(logs_dir)
+    ckpts = checkpoints(logs_dir, os.path.dirname(path) if path else None)
     if ckpts:
         last_it, _, last_mtime = ckpts[-1]
         lines.append(
@@ -365,7 +373,7 @@ def snapshot(logs_dir, target):
             out['remaining'] = human_duration((target - it) * speed)
             out['eta'] = time.strftime('%H:%M', time.localtime(now + (target - it) * speed))
 
-    ckpts = checkpoints(logs_dir)
+    ckpts = checkpoints(logs_dir, os.path.dirname(path))
     if ckpts:
         last_it, _, _ = ckpts[-1]
         out['ckpt'] = last_it
