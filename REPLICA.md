@@ -334,7 +334,7 @@ systemctl restart microduck-hd1910
 回退：`mv robotd.bak-20261013 robotd` + 删掉那一格 + 重启。
 
 **`build.sh` 只编 `robotd` / `robotctl` / `microduck-app-server`。** `padd`（手柄）带 C 依赖，
-要单独编 —— 先 export sysroot（做法见 `手柄连接.md`「编 padd」）：
+要单独编 —— 先 export sysroot（做法见 `docs/手柄连接.md`「编 padd」）：
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"

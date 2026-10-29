@@ -5,7 +5,7 @@
 
 [Unit]
 Description=AIC8800 bluetooth liveness recorder
-Documentation=file:///home/duck/workspace/microduck-hd1910m/手柄连接.md
+Documentation=file:///home/duck/workspace/microduck-hd1910m/docs/手柄连接.md
 After=bluetooth.service multi-user.target
 
 [Service]

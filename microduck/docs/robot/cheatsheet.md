@@ -328,10 +328,11 @@ the analog triggers, which are the mouth and the quack. An empty name switches a
 `pad reset <button>` puts one back. The defaults are the mapping the prototype had, so a robot
 with no `[pad]` section behaves exactly as it always has.
 
-The rest of the pad is not bindable: Start toggles the policy, Y and B change what the sticks
-mean, and held Select powers the robot off — the button that stops a robot is the one worth not
-being able to lose to a config edit. A name is checked against what the robot actually has, so a
-typo is refused with the list rather than becoming a dead button.
+The rest of the pad is not bindable: Start stands the robot up and then toggles the policy, Y and
+B change what the sticks mean, D-pad up cycles those same modes, and Select is the stop on
+release — held, it powers the robot off. The button that stops a robot is the one worth not being
+able to lose to a config edit. A name is checked against what the robot actually has, so a typo is
+refused with the list rather than becoming a dead button.
 
 #### Putting it all back
 
@@ -418,8 +419,8 @@ so have the robot on its stand. It needs no policy, and it is what the gamepad's
 to driving, so by hand it is a bench thing.
 
 `relax` cuts power and **the robot collapses** if nothing holds it, which is why it wants `--yes`. It
-is the only way back to limp short of pulling the plug: pressing Start again stops the policy and
-keeps the robot standing, and `robot.stop` zeroes the velocity while still standing.
+is the only way back to limp short of pulling the plug: pressing Start to stop the policy keeps the
+robot standing, and `robot.stop` zeroes the velocity while still standing.
 
 Both go through `robotd`, which owns the motor bus. `robotd init` — the subcommand — still exists for
 a robot whose daemon is not running, and it needs the daemon stopped, because two writers on one UART
@@ -467,7 +468,7 @@ mapping is the prototype's, so muscle memory carries over:
 | --- | --- |
 | left stick | drive: forward/back and strafe · head: head yaw and pitch · body pose: up and crouch |
 | right stick | drive: turn · head: neck pitch and head roll · body pose: pitch and roll |
-| **Start** | toggle the policy — nothing moves until it is on |
+| **Start** | first press: torque on and a 2 s ramp to the home pose, then hold. Second press: the policy drives. After that it toggles the policy |
 | **Y** / triangle | head mode: sticks pose the head (body holds still) |
 | **B** / circle | body-pose mode: sticks lean and crouch the standing robot |
 | **A** / cross | ground pick |
@@ -475,20 +476,17 @@ mapping is the prototype's, so muscle memory carries over:
 | **LB / RB** | left / right kick |
 | **DPad-Down** | sit ↔ stand |
 | **RT / LT** | mouth (either trigger) — RT also quacks; LT rides the "wheee" while held |
-| **DPad-Up**, held 3 s | switch drive mode, walk ⇄ roller |
-| **Select**, held 2 s | sit down, then power off |
+| **DPad-Up** | cycle the stick mode: drive → head → body pose → drive |
+| **DPad-Left**, held 2 s | clear a latched servo fault — all joint power goes off |
+| **Select**, short press | torque off (`robot.relax`) **on release**: the emergency stop. Then Start stands it up again |
+| **Select**, held 2 s | sit down, torque off, power off — the release afterwards does nothing more |
 
-There is no stop button: release the sticks and the robot stands, and `robotd`'s deadman stops it
-if `padd` dies. On a roller robot (`mode = "roller"` in `robotd.toml`) the sticks take the roller
-shaping automatically — asymmetric push/brake, no strafe — and A triggers the crouch. The
-other skills ride along: sit, kicks and the roulade work on wheels too, as the prototype has it.
-
-**Holding DPad-Up switches between the two**, for when you have just put wheels on the duck or
-taken them off: the robot quacks once for walking or twice for roller, returns to its home pose,
-loads that mode's policies there and drives again — a few seconds, torque on throughout, no
-restart. `robotd.toml` is not touched, so a reboot comes back in the configured mode; make it
-stick with `robotctl configure` (or `[policy] mode`). It is a hold rather than a press because
-D-pad up is easy to lean on while driving.
+There is no separate stop button while driving: release the sticks and the robot stands, and
+`robotd`'s deadman stops it if `padd` dies. Select is the stop when something has gone wrong — a
+short press drops torque, and the robot goes limp where it stands. On a roller robot
+(`mode = "roller"` in `robotd.toml`) the sticks take the roller shaping automatically — asymmetric
+push/brake, no strafe — and A triggers the crouch. The other skills ride along: sit, kicks and the
+roulade work on wheels too, as the prototype has it.
 
 `pad status` answers two questions separately, because a connected pad and a dead driver look
 identical from the outside:
