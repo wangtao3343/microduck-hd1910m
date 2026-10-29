@@ -27,7 +27,7 @@
 //! ```text
 //! Start        first press: torque on and a 2 s ramp to the home pose, then hold.
 //!              Second press: the policy drives. After that it toggles the policy
-//! Y (North)    head mode — sticks pose the head
+//! X (North)    head mode — sticks pose the head
 //! B (East)     body-pose mode — sticks lean and crouch the standing robot
 //! A (South)    ground pick
 //! LB / RB      left / right kick
@@ -38,6 +38,11 @@
 //! Select, 2 s  sit down, torque off, then power off — the release does nothing more
 //! DPad-Left, 2 s  clear a latched servo fault (all joint power goes off)
 //! ```
+//!
+//! Names in parentheses are gilrs's *positions*, not labels. On a pad gilrs has no mapping for
+//! — the GameSir on this robot — the fallback maps raw evdev codes, so North is the X-labelled
+//! button and West (the `x` binding, `roulade`) is the Y one. A mapped pad has them the other
+//! way round, which is why the upstream docs say "Y head, X roulade".
 //!
 //! Head and body-pose mode both zero the velocity while active, as the prototype does — a
 //! robot that keeps walking because you started posing its head is a bad surprise.
