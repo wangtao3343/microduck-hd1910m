@@ -3,8 +3,8 @@
 记录日期 2026-10-28。对照四份：
 
 - **A** = 本仓库 [microduck_rl](../microduck_rl)，pollen-robotics 上游 + HD1910 集成
-- **B** = `/Users/wangtao/Work/Microduck-kissqy/microduck-hd1910/training-console`，kissqy 训练控制台
-- **C** = `/Users/wangtao/Work/microduck/microduck_rl_wt`，另一份 microduck_rl 工作树，**已按实称质量改过模型**
+- **B** = `/home/ai/Microduck-kissqy/microduck-hd1910/training-console`，kissqy 训练控制台
+- **C** = `/home/ai/microduck/microduck_rl_wt`，另一份 microduck_rl 工作树，**已按实称质量改过模型**
 - **D** = `/Users/wangtao/Work/microduck_rl_retrain`，**A 的 HD1910 框架 + C 的实测质量模型**，已训完 8000 迭代并导出 ONNX
 
 用途：训前按实机校正质量参数时，知道该信哪个数、改哪个文件。
