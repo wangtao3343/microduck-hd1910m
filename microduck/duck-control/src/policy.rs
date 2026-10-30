@@ -437,6 +437,9 @@ impl Policy {
             Some(homes) => homes[match net {
                 Net::GroundPick => 1,
                 Net::Skill(i) => 2 + i,
+                // Sit-stand was trained on its own HOME (hip pitch/ankle ~0.45 vs the
+                // shipped walk's ~0.35). Borrowing walk's home shifts every action.
+                Net::SitStand if homes.len() > 4 => 4,
                 _ => 0,
             }],
         }
@@ -446,42 +449,48 @@ impl Policy {
     /// them through the bounded-slew HD profile or substitute a missing skill.
     pub fn load_reference(paths: &PolicyPaths) -> Result<Self, PolicyError> {
         use sha2::{Digest, Sha256};
-        if paths.stand.is_some() || paths.sitstand.is_some() || paths.skills.len() != 2 {
-            return Err(PolicyError::Inference("Reference requires walk, pick, recovery, roulade; no stand/sitstand graph".into()));
+        if paths.stand.is_some() || paths.skills.len() != 2 {
+            return Err(PolicyError::Inference("Reference requires walk, pick, recovery, roulade; no stand graph".into()));
         }
         let pick = paths.ground_pick.as_ref().ok_or_else(|| PolicyError::Inference("Reference pick missing".into()))?;
         ensure_runtime()?;
         catching_ort_panics(|| {
-            let files = [&paths.walk, pick, &paths.skills[0], &paths.skills[1]];
             // Walk, pick and roulade each accept a second graph: the kissqy set
             // this board rehearses (2026-10-27). Recovery stays pinned — it is the
             // fall get-up, and a mismatched graph there is what the contract exists
             // to catch.
-            let hashes: [&[&str]; 4] = [
-                &[
-                    // Shipped reference walk (reference_runtime_20261005).
-                    "5727b909d5ea1a0f9ff63bf4cea9707339dea6a522374c7a120da633605b923f",
-                    // kissqy upstream `firmware/policies/walk/policy.onnx`
-                    // (velstand 2026-10-07 model_9599), added 2026-10-27 to
-                    // rehearse it on this duck.
-                    "1cbf8730eadd75a5704332c9f3c10f60bfa9412135b907831c9dbd731ce1795f",
-                ],
-                &[
-                    // Shipped reference pick.
-                    "f34e990dda785e9a8c53890bdcd0f7f1d457592691fd3703f3776b48fb2d14b8",
-                    // kissqy upstream `firmware/policies/ground_pick/policy.onnx`,
-                    // added 2026-10-27 with the walk swap. Trained on the 2.8 s
-                    // window, so a board running it wants `ground_pick_end_phase`.
-                    "b14e3a8b56ddbb8d2d831e727774a168c8f5b00194e3e431ae7593a840498c69",
-                ],
-                &["c414f2bd84b0a79b89f0ba6997135eb45e4ecd9df9271ea989c237864027b2a3"],
-                &[
-                    // Shipped reference roulade.
-                    "8adb1e6bc3f5eef751ce4edbf940f6d5a25fdec3ec4a798e1d9ca135c8248e97",
-                    // kissqy upstream `firmware/policies/roulade/policy.onnx`.
-                    "59e15d7b04d0c40e9b11b8a70bdecae6da87a5e096efc204fb58eea304fcbbac",
-                ],
+            let walk_hashes: &[&str] = &[
+                // Shipped reference walk (reference_runtime_20261005).
+                "5727b909d5ea1a0f9ff63bf4cea9707339dea6a522374c7a120da633605b923f",
+                // kissqy upstream `firmware/policies/walk/policy.onnx`
+                // (velstand 2026-10-07 model_9599), added 2026-10-27 to
+                // rehearse it on this duck.
+                "1cbf8730eadd75a5704332c9f3c10f60bfa9412135b907831c9dbd731ce1795f",
             ];
+            let pick_hashes: &[&str] = &[
+                // Shipped reference pick.
+                "f34e990dda785e9a8c53890bdcd0f7f1d457592691fd3703f3776b48fb2d14b8",
+                // kissqy upstream `firmware/policies/ground_pick/policy.onnx`,
+                // added 2026-10-27 with the walk swap. Trained on the 2.8 s
+                // window, so a board running it wants `ground_pick_end_phase`.
+                "b14e3a8b56ddbb8d2d831e727774a168c8f5b00194e3e431ae7593a840498c69",
+            ];
+            let getup_hashes: &[&str] = &["c414f2bd84b0a79b89f0ba6997135eb45e4ecd9df9271ea989c237864027b2a3"];
+            let roulade_hashes: &[&str] = &[
+                // Shipped reference roulade.
+                "8adb1e6bc3f5eef751ce4edbf940f6d5a25fdec3ec4a798e1d9ca135c8248e97",
+                // kissqy upstream `firmware/policies/roulade/policy.onnx`.
+                "59e15d7b04d0c40e9b11b8a70bdecae6da87a5e096efc204fb58eea304fcbbac",
+            ];
+            // Sit-stand is pinch-sit only: kissqy's `stand.onnx` is a fallen-pose
+            // get-up teacher, not a standing policy, so it stays unloadable here.
+            let sitstand_hashes: &[&str] = &["1c94934c6421ec72ed48079cea74966868a7a59f7d732e0207d0f7bdaeed3c50"];
+            let mut files: Vec<&PathBuf> = vec![&paths.walk, pick, &paths.skills[0], &paths.skills[1]];
+            let mut hashes: Vec<&[&str]> = vec![walk_hashes, pick_hashes, getup_hashes, roulade_hashes];
+            if let Some(sitstand) = paths.sitstand.as_ref() {
+                files.push(sitstand);
+                hashes.push(sitstand_hashes);
+            }
             let names = crate::model::JOINT_NAMES.iter().enumerate()
                 .filter(|(i, _)| *i != crate::model::MOUTH_INDEX).map(|(_, n)| *n).collect::<Vec<_>>().join(",");
             let mut sessions = Vec::new();
@@ -507,12 +516,15 @@ impl Policy {
                 run(&mut session, path, &Observation::zeroed())?;
                 sessions.push(session);
             }
+            // `files` order is walk, pick, recovery, roulade, [sitstand], so the
+            // optional last session comes off the end before the fixed slots.
+            let sitstand = if paths.sitstand.is_some() { Some(sessions.pop().expect("sitstand session")) } else { None };
             let walk = sessions.remove(0);
             let ground_pick = Some(sessions.remove(0));
             Ok(Self {
                 reference_homes: Some(homes), hd_reference: false,
                 coherent_joint_snapshot: true, coherent_skill_snapshots: vec![true; 2],
-                walk, ground_pick, stand: None, sitstand: None, skills: sessions,
+                walk, ground_pick, stand: None, sitstand, skills: sessions,
                 standing_threshold: DEFAULT_STANDING_THRESHOLD, standing_disabled: true,
             })
         })

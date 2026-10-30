@@ -1,6 +1,15 @@
 # 接入 kissqy 的 sitstand（坐下/站起）
 
-**2026-10-29 记录，状态：尚未改代码，待开发机编译 + 上板验证。**
+**2026-10-29 记录。2026-10-31 更新：§3.1 的代码已提交并上板，`policy loaded … sitstand=Some(…)`，
+十字键 ↓ 坐下/起身都通。** 用仓库里的五张图（kissqy walk / ground_pick / roulade / sitstand
++ reference getup）跑 `Policy::load_reference`：加载成功，`has_sitstand = true`，sitstand
+的 sha256 和 §1 表里的一致。sitstand 的 `default_joint_pos` 与 kissqy walk 的**逐项相同**
+（都是 hip/ankle 0.458 那一版），所以 §6 里"借 walk 的 home 会整体偏移"在这套图上不成立——
+`home(Net::SitStand)` = `home(Net::Walk)`。
+
+**同一天又改了起身：** 开机时"坐着就用 sitstand 网络顶起来"那条路删掉了——它的起身太急，
+弱电池下会顶出过流。现在**任何**起身都是斜坡（站着 4 秒、趴着 5 秒），到站姿叫三声。
+sitstand 网络只剩十字键 ↓ 的坐/起在用。
 
 文件在 `radxa/references/kissqy_20261027/`，git 已跟踪。同一个目录里的
 `stand.onnx` **不要接**，原因见下。
@@ -21,6 +30,9 @@ sitstand 的 ONNX 元数据和 walk 同一套：`joint_names` 是 14 个（顺�
 起身/站立 `[0,0,0]`）—— 本地 `control.rs` 的 `Sit::Sitting` / `Sit::Rising` 已经是这么发的。
 
 ## 2. 为什么现在加载不了
+
+> **2026-10-31：这一节已经过时。** §3.1 的改动已经落到工作树，`load_reference` 不再
+> 拒绝 sitstand，`stand.onnx` 仍然拒绝。留着是记当时的诊断过程。
 
 1. `duck-control/src/policy.rs:449` 明确拒绝：
 
