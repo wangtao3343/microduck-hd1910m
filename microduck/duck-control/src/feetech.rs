@@ -1144,9 +1144,25 @@ impl FeetechIo {
                 .torque_checked_at
                 .is_none_or(|t| t.elapsed() >= self.torque_poll_interval.unwrap())
         {
-            if self.sync_read(40, 1)?.iter().any(|r| r[0] != 1) {
+            let enable = self.sync_read(40, 1)?;
+            // Name the servos rather than saying "some servo". When a bus fault is
+            // being diagnosed, which joint came back with its torque off is the only
+            // question worth asking — a servo that browned out resets to torque 0, and
+            // one that is simply unplugged never answers at all — and an error that
+            // does not say which one cannot be acted on.
+            let off: Vec<u8> = self
+                .ids
+                .iter()
+                .zip(&enable)
+                .filter(|(_, row)| row[0] != 1)
+                .map(|(id, _)| *id)
+                .collect();
+            if !off.is_empty() {
                 self.enabled = false;
-                return Err(err("enable feedback lost; explicit re-init required"));
+                return Err(err(format!(
+                    "enable feedback lost on ID {}; explicit re-init required",
+                    off.iter().map(u8::to_string).collect::<Vec<_>>().join(",")
+                )));
             }
             self.torque_checked_at = Some(Instant::now());
         }
@@ -1189,9 +1205,22 @@ impl FeetechIo {
                 return Err(error);
             }
         };
-        if combined && rows.iter().take(NUM_JOINTS).any(|row| row[enable_offset] != 1) {
-            self.enabled = false;
-            return Err(err("enable feedback lost; explicit re-init required"));
+        if combined {
+            // Same reason as the separate-torque path above: the ID is the answer.
+            let off: Vec<u8> = self
+                .joints
+                .iter()
+                .zip(&rows)
+                .filter(|(_, row)| row[enable_offset] != 1)
+                .map(|(j, _)| j.id)
+                .collect();
+            if !off.is_empty() {
+                self.enabled = false;
+                return Err(err(format!(
+                    "enable feedback lost on ID {}; explicit re-init required",
+                    off.iter().map(u8::to_string).collect::<Vec<_>>().join(",")
+                )));
+            }
         }
         if combined { self.torque_checked_at = Some(Instant::now()); }
         let mut out = Sensors::default();
@@ -1205,7 +1234,17 @@ impl FeetechIo {
             let ticks = signed([row[0], row[1]]);
             let (low, high, max_temp) = self.limits[i];
             if ticks < low || ticks > high || row[7] >= max_temp {
-                return Err(err(format!("ID {}: invalid position/temperature", j.id)));
+                // The numbers, not just the verdict. A supply glitch garbles an
+                // encoder and a servo that is genuinely hot both land here, and only
+                // the values tell them apart — "invalid position/temperature" alone
+                // is a message that sends the next reader back to the start.
+                return Err(err(format!(
+                    "ID {}: invalid position/temperature position={ticks} \
+                     range={low}..{high} voltage={:.1}V temperature={}C max={max_temp}C",
+                    j.id,
+                    row[6] as f64 / 10.,
+                    row[7]
+                )));
             }
             out.positions[i] = (ticks - j.zero_ticks) as f64 * RAD_TICK * j.direction as f64;
             out.velocities[i] = signed([row[2], row[3]]) as f64 * 0.732 * std::f64::consts::TAU
@@ -2369,6 +2408,10 @@ mod tests {
         use serialport::SerialPort;
         let (mut io, mut peer) = fixture();
         io.allow_motion = true;
+        // The message has to name the servo that lost torque. A servo that browned
+        // out and one that is simply unplugged look the same to the driver, and the
+        // only thing that tells them apart is which ID it is.
+        let culprit = io.ids[3];
         let ids = io.ids.clone();
         let worker = std::thread::spawn(move || {
             let mut rows = vec![vec![0; 31]; 15];
@@ -2381,16 +2424,46 @@ mod tests {
             reply_rows(&mut peer, &ids, 40, &rows);
             peer
         });
+        let error = io.read().unwrap_err().to_string();
+        assert!(error.contains("enable feedback lost"), "{error}");
         assert!(
-            io.read()
-                .unwrap_err()
-                .to_string()
-                .contains("enable feedback lost")
+            error.contains(format!("ID {culprit}").as_str()),
+            "{error}"
         );
         let peer = worker.join().unwrap();
         assert!(!io.enabled);
         assert!(io.write(&JointTargets::new([0.; 15])).is_err());
         assert_eq!(peer.bytes_to_read().unwrap(), 0);
+    }
+    #[test]
+    fn pty_bad_reading_reports_the_numbers_not_just_the_verdict() {
+        use serialport::SerialPort;
+        let (mut io, mut peer) = fixture();
+        // A supply glitch garbles the encoder and a servo that is genuinely hot both
+        // land on this same check. Only the values tell them apart, so the values are
+        // what the message has to carry.
+        io.limits = vec![(0, 4095, 80); 15];
+        let first = io.ids[0];
+        let ids = io.ids.clone();
+        let worker = std::thread::spawn(move || {
+            let mut rows = vec![vec![0u8; 15]; 15];
+            for row in &mut rows {
+                row[0] = 8;
+                row[6] = 74; // 7.4 V
+                row[7] = 90; // past the 80 °C limit
+            }
+            reply_rows(&mut peer, &ids, 56, &rows);
+            peer
+        });
+        let error = io.read().unwrap_err().to_string();
+        assert!(error.contains("invalid position/temperature"), "{error}");
+        assert!(
+            error.contains(format!("ID {first}").as_str()),
+            "{error}"
+        );
+        assert!(error.contains("temperature=90"), "{error}");
+        assert!(error.contains("7.4V"), "{error}");
+        worker.join().unwrap();
     }
     #[test]
     fn pty_timeout_reports_missing_device_and_leaves_output_stale() {
