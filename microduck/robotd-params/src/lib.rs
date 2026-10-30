@@ -1483,6 +1483,48 @@ pub struct SafetyParams {
     /// load sag cannot trip it.
     pub battery_empty_shutdown: bool,
 
+    /// Say so out loud — one `alarm` from the voice bank, repeated while it lasts — when
+    /// the motor bus sags below this many volts. Zero disables it.
+    ///
+    /// The 7.5 V default (about 56% on the linear scale) is set from the failures this
+    /// exists to predict: the pack that would not stand the robot up read 7.38–7.43 V on
+    /// the way down, so a warning at the usual "nearly empty" mark would arrive after the
+    /// duck had already stopped answering.
+    ///
+    /// Read from the **raw** one-per-second bus sample, not the ten-second EMA above.
+    /// That is the whole point: the failure worth hearing about is a pack that cannot
+    /// hold up under a servo-heavy move, and an EMA that slow is exactly what smooths
+    /// one away. Two consecutive samples below the threshold before it counts, so a
+    /// single noisy read cannot start the duck shouting; it re-arms after one sample back
+    /// above, and repeats about every 30 s while it stays low.
+    ///
+    /// A warning, nothing more: unlike [`Self::battery_empty_shutdown`] it commands
+    /// nothing, so a robot whose pack is merely tired keeps working for its operator.
+    pub battery_warn_v: f64,
+
+    /// Clear a latched bus fault by itself instead of waiting for somebody to hold
+    /// D-pad left.
+    ///
+    /// A servo that browns out restarts, and a restarted servo reports torque off. The
+    /// Feetech driver reads that as a latch — every later read and write is refused
+    /// until it is re-initialized — so one transient ends the session, and the only way
+    /// out is a button on the pad, on a robot that is by then limp on the floor. This
+    /// retries that same reset, unasked, after `bus_auto_recover_ms` of unbroken failed
+    /// reads.
+    ///
+    /// Torque stays off afterwards, exactly as the button leaves it: recovering the bus
+    /// is not the same decision as asking the robot to move again, and a robot on its
+    /// side must not stand up because its servos started answering. Resuming is the
+    /// human's Start.
+    pub bus_auto_recover: bool,
+
+    /// How long the bus has to stay broken before that reset is attempted.
+    ///
+    /// Long enough that a dropped transaction — which `robotd` deliberately coasts over
+    /// for `COAST_TICKS` — cannot trigger it, short enough that a real brownout does not
+    /// leave the robot dead on the floor for as long as it takes somebody to notice.
+    pub bus_auto_recover_ms: u64,
+
     /// Go limp *while falling*, to land soft instead of fighting the floor all the way
     /// down. **On by default** since it was validated on a robot — the whole point is that
     /// the fleet lands soft, and a mode every board has to opt into individually is a mode
@@ -1564,6 +1606,9 @@ impl Default for SafetyParams {
             deadman_ms: 500,
             gain_limp: 50,
             battery_empty_shutdown: true,
+            battery_warn_v: 7.5,
+            bus_auto_recover: true,
+            bus_auto_recover_ms: 4000,
             limp_fall: true,
             limp_fall_tilt_z: -0.90,
             limp_fall_predict_z: -0.5,

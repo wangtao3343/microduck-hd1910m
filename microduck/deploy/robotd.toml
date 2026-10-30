@@ -256,6 +256,33 @@ mode = "walk"
 # ~10 s, so a load sag cannot trip it; reaching 6.6 requires a genuinely spent pack.
 # battery_empty_shutdown = true
 
+# Say so out loud — one `alarm` from the voice bank, repeated about every 30 s — when the
+# motor bus sags below this many volts. Zero disables it.
+#
+# This reads the raw one-per-second bus sample, not the ten-second EMA above: the failure
+# worth hearing about is a pack that cannot hold up under a servo-heavy move, and an EMA
+# that slow is what smooths one away. Two samples in a row below the threshold before it
+# counts. It is only a warning — nothing is commanded, nothing is stopped.
+#
+# 7.5 V is about 56% on the linear scale, and it is that high on purpose: the packs that
+# failed to stand the robot up read 7.38–7.43 V, so the usual "nearly empty" threshold would
+# speak only after the duck had already gone quiet.
+# battery_warn_v = 7.5
+
+# Clear a latched bus fault without waiting for somebody to hold D-pad left.
+#
+# A servo that browns out restarts, and a restarted servo reports torque off. The Feetech
+# driver reads that as a latch — every later read and write is refused until it is
+# re-initialized — so one transient used to end the session, and the only way out was a
+# button on the pad, on a robot that was by then limp on the floor. This sends that same
+# reset by itself once the bus has been quiet of good reads for `bus_auto_recover_ms`.
+#
+# Torque stays off afterwards, exactly as the button leaves it: recovering the bus is not
+# the same decision as asking the robot to move again, and a robot lying on its side must
+# not stand up because its servos started answering. Resuming is the human's Start.
+# bus_auto_recover = true
+# bus_auto_recover_ms = 4000
+
 [audio]
 # The robot's voice (the seeded synth bank under /var/lib/robot/sounds — rendered by the
 # release's postinstall, `sounds ensure-bank`) and its ear (the petting classifier on the

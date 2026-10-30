@@ -438,32 +438,6 @@ impl Controller {
         Ok(true)
     }
 
-    /// The index of this robot's getup skill, if it has one.
-    ///
-    /// Found by name, not by position. The reference contract happens to put recovery first,
-    /// and [`Self::step`] already relies on that for the upright test — but a robot whose
-    /// config orders its skills differently must not have the wrong network handed a robot
-    /// lying on the floor.
-    fn getup_index(&self) -> Option<usize> {
-        self.skill_names().iter().position(|name| name == GETUP_SKILL)
-    }
-
-    /// Torque has just come on with the robot not standing: put the getup network in charge
-    /// instead of the linear ramp to home.
-    ///
-    /// The ramp interpolates *through* whatever pose the robot is in, which for a duck lying
-    /// down means dragging folded legs across the floor and handing the walker a robot still
-    /// mid-scramble — observed on a board as "it tries to stand up and falls over". The getup
-    /// network is the thing trained for that pose; it ends itself once the robot has been
-    /// upright for a second, and the walker takes over from there.
-    ///
-    /// `Err` means this robot has no getup skill, which is not a failure: the caller falls
-    /// back to the ramp, which is what it did before this existed.
-    pub fn begin_getup(&mut self) -> Result<(), &'static str> {
-        let index = self.getup_index().ok_or("no getup skill on this robot")?;
-        self.start_skill(index).map(|_| ())
-    }
-
     pub fn cancel_manual_step(&mut self) {
         if self.policy.is_reference() {
             if !self.busy() { return; }
@@ -504,14 +478,6 @@ impl Controller {
     /// charge with the posture flag at 1.
     pub fn begin_shutdown_sit(&mut self) {
         self.sit = Sit::Sitting;
-    }
-
-    /// Seated boot: the robot powered on already sitting, so rise via the sitstand network
-    /// instead of dragging the legs through a linear ramp to the standing pose.
-    pub fn begin_boot_rise(&mut self) {
-        self.sit = Sit::Rising {
-            remaining: self.skills.sitstand_rise_s,
-        };
     }
 
     /// One tick.

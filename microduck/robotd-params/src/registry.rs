@@ -246,6 +246,21 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Bool,
         "Sit and power off when the battery EMA reaches empty",
     ),
+    entry(
+        "safety.battery_warn_v",
+        Kind::Float,
+        "Bus volts below which the robot says so out loud; 0 disables",
+    ),
+    feature(
+        "safety.bus_auto_recover",
+        Kind::Bool,
+        "Reset a latched bus fault by itself; torque stays off for a human to resume",
+    ),
+    entry(
+        "safety.bus_auto_recover_ms",
+        Kind::Integer,
+        "How long the bus must stay broken before that reset",
+    ),
     feature(
         "safety.limp_fall",
         Kind::Bool,
@@ -599,6 +614,7 @@ mod tests {
                 "policy.mode",
                 "policy.voltage_adapt",
                 "safety.battery_empty_shutdown",
+                "safety.bus_auto_recover",
                 "safety.limp_fall",
                 "detect.enabled",
                 "chorale.accept",
