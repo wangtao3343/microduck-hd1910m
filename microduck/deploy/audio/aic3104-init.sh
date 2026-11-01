@@ -31,9 +31,16 @@ for i in $(seq 1 15); do
         amixer -c aic3104 sset 'Left PGA Mixer Line1R'  off >/dev/null
         amixer -c aic3104 sset 'Left PGA Mixer Line1L'  off >/dev/null
         amixer -c aic3104 sset 'Right PGA Mixer Line2R' off >/dev/null
-        # Capture path: enable PGA capture switch and set gain (0-119)
+        # Capture path: enable PGA capture switch and set gain (0-119, 0.5 dB steps).
+        # 72 = 36 dB, measured 2026-11-02: normal speech at 30 cm lands at -17..-21 dBFS.
+        # The old value (60 = 30 dB) was quiet enough that callers turned the gain up by
+        # hand; 90 = 45 dB clips a normal voice at that distance, and a clipped recording
+        # sounds like broadband noise, not like "too loud".
         amixer -c aic3104 cset name='PGA Capture Switch' on,on >/dev/null
-        amixer -c aic3104 cset name='PGA Capture Volume' 60,60 >/dev/null
+        amixer -c aic3104 cset name='PGA Capture Volume' 72,72 >/dev/null
+        # The ADC high-pass is off by default, which leaves a ~900-1500 LSB DC offset in
+        # every capture. 0.0045xFs (= 216 Hz at 48 kHz) removes it without touching speech.
+        amixer -c aic3104 cset name='ADC HPF Cut-off' 0.0045xFs >/dev/null
 
         echo "TLV320AIC3104 mixer levels set"
         break
