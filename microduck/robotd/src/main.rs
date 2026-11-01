@@ -132,6 +132,12 @@ const BATTERY_EMA_ALPHA: f64 = 0.1;
 /// duck is still doing the thing that caused it.
 const BATTERY_WARN_SAMPLES: u32 = 2;
 
+/// Volts above `safety.battery_warn_v` a pack has to climb before the warning clears. Without
+/// it, a pack resting on the threshold flaps the latch on alternate samples, and every re-arm
+/// speaks at once — [`BATTERY_WARN_REPEAT`] never gets a chance to apply and the duck becomes
+/// the only thing you can hear.
+const BATTERY_WARN_CLEAR_MARGIN: f64 = 0.1;
+
 /// How often the low-pack warning repeats while it stays low. Frequent enough to hear over
 /// the motors, rare enough not to be the only thing the duck ever says.
 const BATTERY_WARN_REPEAT: Duration = Duration::from_secs(30);
@@ -3650,25 +3656,49 @@ fn publish_slow_sensors<T: RobotIo>(io: &mut Safety<T>, state: &RobotState, batt
 ///
 /// On the raw sample and not the EMA, because the failure this exists for is a pack sagging
 /// under a servo-heavy move — exactly what a ten-second average removes. Two samples in a
-/// row before it arms, so one dropped transaction cannot start the duck shouting, and one
-/// sample back above clears it, so a recovered pack goes quiet at once rather than hanging
-/// on. A zero threshold disables the whole thing and clears the latch.
+/// row before it arms, so one dropped transaction cannot start the duck shouting.
+///
+/// Clearing is not the mirror image of arming: it takes two samples at or above `warn_v` plus
+/// [`BATTERY_WARN_CLEAR_MARGIN`]. A pack sitting right on the line otherwise re-arms every few
+/// seconds, and each arm speaks immediately, so the operator hears a flood instead of the
+/// [`BATTERY_WARN_REPEAT`] heartbeat. An unread sample (zero volts) is evidence of neither
+/// state: the latch holds and the run starts over. A zero threshold disables the whole thing
+/// and clears the latch.
 fn track_battery_warning(state: &RobotState, volts: f64, warn_v: f64) -> bool {
     if !(warn_v > 0.0) {
         state.battery_low.store(false, Ordering::Relaxed);
         state.battery_low_run.store(0, Ordering::Relaxed);
         return false;
     }
-    let low = volts > 0.0 && volts <= warn_v;
-    let run = if low {
+    // `!(volts > 0.0)` and not `volts <= 0.0`: this also swallows a NaN, which must not be
+    // read as "flat" any more than as "full".
+    if !(volts > 0.0) {
+        state.battery_low_run.store(0, Ordering::Relaxed);
+        return false;
+    }
+    let armed = state.battery_low.load(Ordering::Relaxed);
+    let crossing = if armed {
+        volts >= warn_v + BATTERY_WARN_CLEAR_MARGIN
+    } else {
+        volts <= warn_v
+    };
+    let run = if crossing {
         state.battery_low_run.fetch_add(1, Ordering::Relaxed) + 1
     } else {
         state.battery_low_run.store(0, Ordering::Relaxed);
         0
     };
-    let armed = low && run >= BATTERY_WARN_SAMPLES;
-    let was = state.battery_low.swap(armed, Ordering::Relaxed);
-    armed && !was
+    if run < BATTERY_WARN_SAMPLES {
+        return false;
+    }
+    state.battery_low_run.store(0, Ordering::Relaxed);
+    if armed {
+        state.battery_low.store(false, Ordering::Relaxed);
+        false
+    } else {
+        state.battery_low.store(true, Ordering::Relaxed);
+        true
+    }
 }
 
 async fn serve(
@@ -4916,7 +4946,7 @@ mod tests {
 
     /// **A low pack is heard about while it is sagging, not ten seconds later.** The warning
     /// runs off the raw sample with a two-sample debounce, speaks once when it arms, and goes
-    /// quiet the moment the pack comes back up.
+    /// quiet only once the pack has climbed clear of the threshold.
     #[test]
     fn the_low_battery_warning_debounces_and_rearms() {
         let (_dir, state) = state_over("");
@@ -4931,25 +4961,51 @@ mod tests {
         assert!(!track_battery_warning(&state, 7.0, 7.2));
         assert!(state.battery_low.load(Ordering::Relaxed));
 
-        // Back above the threshold: quiet at once, no waiting for a run to unwind.
-        assert!(!track_battery_warning(&state, 7.4, 7.2));
+        // Climbing back over the threshold is not recovery: the pack has to clear it by the
+        // margin, and stay clear for two samples, before the latch drops.
+        assert!(!track_battery_warning(&state, 7.25, 7.2));
+        assert!(state.battery_low.load(Ordering::Relaxed));
+        assert!(!track_battery_warning(&state, 7.35, 7.2));
+        assert!(state.battery_low.load(Ordering::Relaxed));
+        assert!(!track_battery_warning(&state, 7.35, 7.2));
         assert!(!state.battery_low.load(Ordering::Relaxed));
 
         // And it can arm again afterwards.
         assert!(!track_battery_warning(&state, 7.0, 7.2));
         assert!(track_battery_warning(&state, 7.0, 7.2));
 
-        // Zero volts means *not read yet*, never "flat" — otherwise a bus that has not
-        // answered yet would have the robot shouting at a battery nobody has looked at.
+        // Zero volts means *not read yet*, never "flat" — and it is not evidence of recovery
+        // either, so a warning that is already up stays up through a missing reading.
         assert!(!track_battery_warning(&state, 0.0, 7.2));
-        assert!(!state.battery_low.load(Ordering::Relaxed));
-
-        // Zero threshold disables it and drops any latch that was up — which is also why the
-        // arming below takes two fresh samples again: the unknown reading reset the run.
-        assert!(!track_battery_warning(&state, 7.0, 7.2));
-        assert!(track_battery_warning(&state, 7.0, 7.2));
         assert!(state.battery_low.load(Ordering::Relaxed));
+
+        // Zero threshold disables it and drops any latch that was up.
         assert!(!track_battery_warning(&state, 7.0, 0.0));
+        assert!(!state.battery_low.load(Ordering::Relaxed));
+    }
+
+    /// **A pack sitting on the threshold does not make the duck chatty.** Voltages wobbling
+    /// across `warn_v` used to drop and re-arm the latch every few samples, and each arm spoke
+    /// immediately — the repeat interval never applied. Seen on the bench at 7.44-7.52 V
+    /// against a 7.5 V threshold: a dozen alarms in four minutes instead of one every 30 s.
+    #[test]
+    fn a_battery_sitting_on_the_threshold_speaks_once() {
+        let (_dir, state) = state_over("");
+        assert!(!track_battery_warning(&state, 7.49, 7.5));
+        assert!(track_battery_warning(&state, 7.49, 7.5));
+
+        for volts in [7.51, 7.47, 7.52, 7.46, 7.50, 7.44, 7.53, 7.48, 7.49, 7.51, 7.46, 7.50] {
+            assert!(!track_battery_warning(&state, volts, 7.5), "{volts} re-armed");
+            assert!(
+                state.battery_low.load(Ordering::Relaxed),
+                "{volts} dropped the latch"
+            );
+        }
+
+        // Clear by the margin for two samples and it finally goes quiet.
+        assert!(!track_battery_warning(&state, 7.62, 7.5));
+        assert!(state.battery_low.load(Ordering::Relaxed));
+        assert!(!track_battery_warning(&state, 7.62, 7.5));
         assert!(!state.battery_low.load(Ordering::Relaxed));
     }
 
