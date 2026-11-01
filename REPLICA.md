@@ -174,14 +174,15 @@ WARN robotd: waiting for native Feetech/BNO085; startup reads only
 | `btd` | 蓝牙 BLE 传输适配 | 没装 | 手机走 LAN 就不用；走蓝牙才要 |
 | `configd` | 配 wifi / 身份 | 没装 | 现在是手改配置文件，不用 |
 | `tofd` | 头上 ToF 传感器 | 没装 | 有 ToF 硬件才要 |
-| `mediad` | 摄像头 + WebRTC 网关 | 没装 | 见 §9，没摄像头不做 |
+| `mediad` | 摄像头 + WebRTC 网关（8080 控制台） | **跑着**（2026-11-01 起） | 要网页看画面/遥控才要 |
 | `updaterd` | 更新守护 | **masked** | 我们是手动部署，不用 |
 
 **让鸭子走路，只需要 `robotd`。** 其余全是可选的，缺了不影响它走。
 
 unit 文件在各组件自己的 `systemd/` 下（`microduck/{btd,configd,padd,tof,mediad,updater}/systemd/`）。
 `scripts/build.sh` 只编 `-p robotd -p robotctl`（外加 app-server）；`padd` 单独编（见 §6.5），
-`btd` / `configd` / `tofd` / `mediad` / `updaterd` **从来没生成过**。
+`mediad` 用 [scripts/build-mediad.sh](scripts/build-mediad.sh)（见 §9）；
+`btd` / `configd` / `tofd` / `updaterd` **从来没生成过**。
 
 板上另外有两个非仓内工具（2026-10-17 装）：
 `padd.service`（手柄，单元在 `microduck/padd/systemd/padd-runtime.service`）和
@@ -607,42 +608,59 @@ unit 名字就写着 `MicroDuck HD1910 native runtime and APK backend`。
 > 转给 robotd 的正是不久前把总线锁死的 `robot.clear_fault`（7.2 节）。**打开 motion 之后这条路通了**
 > —— `set_torque(false)` 不再被拒，所以那个死锁自己解开了，以后遇到故障按它有效，不用重启服务。
 
-## 9: 待办 —— 装了摄像头之后跑 `mediad`
+## 9: `mediad` —— 摄像头 + WebRTC 控制台
 
-**触发条件：给鸭子装上摄像头（`/dev/video*` 出现）。在那之前不做。**
+**2026-11-01：已编、已装、已跑。** Radxa 官方 8M（IMX219）的接入过程（overlay、取流、
+「开机黑图」）记在 [docs/摄像头接入.md](docs/摄像头接入.md)。
 
-`mediad` 是上游 workspace 里的一个 Rust 守护进程（[microduck/mediad/](microduck/mediad/)），
-摄像 + 麦克风 + WebRTC。它**没编、也没装到这台板子上** —— [scripts/build.sh:15](scripts/build.sh#L15)
-只编 `-p robotd -p robotctl`。这是故意的，不是漏了。
-
-它提供什么：
+`mediad` 是上游 workspace 里的 Rust 守护进程（[microduck/mediad/](microduck/mediad/)）：
+摄像头 → 硬件 H.264（`mpph264enc`）→ WebRTC，外加一个**内嵌的控制台网页**。
 
 | | |
 |---|---|
-| `http://<robot>:8080/` | **控制台网页**（`--web-port`，默认 8080）—— 就是之前记得的那个 8080 |
-| `<robot>:8443` | WebRTC 信令（`--port`，默认 8443） |
-| 网页里 | 摄像头画面 + 一条 `control` 数据通道直通机器人 API，**浏览器里就能遥控鸭子** |
-| 配置 | `robotd.toml` 的 `[media]` / `[detect]` 两节，跟 robotd 读同一个文件 |
+| `http://192.168.3.10:8080/` | **控制台网页** —— 画面 + 一条 `control` 数据通道直通 robotd |
+| `192.168.3.10:8443` | WebRTC 信令（`webrtcsink` 自带） |
+| 二进制 | `out/arm64/bin/mediad`（6.1 MB） |
+| 构建 | `bash scripts/build-mediad.sh`（`--deploy` 顺带 scp 到板上 `local/`） |
+| unit | `/etc/systemd/system/mediad.service` ← [mediad-runtime.service](microduck/mediad/systemd/mediad-runtime.service) |
+| 配置 | `local/media.toml`（只有 `[media]` / `[detect]` 两节，`robotd-params` 是 `deny_unknown_fields` 的，不能塞 `params.toml`） |
+| socket | `/run/robotd.sock` → `local/robotd.sock` 软链 ← [robotd-socket.tmpfiles.conf](microduck/mediad/systemd/robotd-socket.tmpfiles.conf) |
 
-**现在不做，是因为这三条：**
+### 为什么不进 `scripts/build.sh`
 
-1. **板上没有摄像头** —— `/dev/video*` 不存在，它最主要的那一半是空的
-2. **缺 `webrtcsink` 插件** —— GStreamer 1.26.2 在（它要求 ≥1.22），但这个插件要从
-   gst-plugins-rs 自己编；交叉编译还得用 `scripts/cross-sysroot.sh` 那套 sysroot，
-   整个 workspace 都跟着它
-3. **它不鉴权** —— 源码原话：「Anyone who reaches the signalling port can drive the robot and
-   see its camera」，而且默认绑 `0.0.0.0`
+`mediad` 是 workspace 里唯一带 pkg-config C 依赖（gstreamer-rs）的 crate，裸
+`cargo build --target aarch64…` 会在 `gstreamer-sys` 挂掉。它要
+[microduck/scripts/cross-sysroot.sh](microduck/scripts/cross-sysroot.sh) 那套 sysroot，
+而 `build.sh` 是给「只编 robotd/robotctl」的日常路径用的。单开一个脚本，两件事都干净。
 
-**装好摄像头之后要做的（顺序别反）：**
+### 装机时踩的三个坑（都已修在代码里）
 
-1. 先确认 `/dev/video0` 出得来、`v4l2-ctl --list-formats-ext` 能看到格式
-2. 编 `webrtcsink`（gst-plugins-rs，版本跟板上 1.26.2 对齐）
-3. `cargo build -p mediad`，加进 `scripts/build.sh` 的 `-p` 列表，并补一个 systemd unit
-4. `robotd.toml` 里配 `[media]`（camera / 分辨率 / 帧率 / 码率）
-5. 上板验证：`http://<board>:8080/` 能开、能出画面、网页里的 control 能驱动
-6. **鉴权没有就是没有** —— 只在内网用，别直接暴露到公网
+1. **`Call::RobotClearFault` 让 mediad 编不过** —— 这是我们给 proto 加的变体，上游
+   [route.rs](microduck/mediad/src/route.rs) 的穷举匹配没覆盖它。按 `RobotRelax` 同样的理由
+   放行（前半段就是卸力，远端能从镜头里看到鸭子）。
+2. **sysroot 只装 `-dev` 包不够** —— glib/gio 的 DT_NEEDED 里有 pcre2/ffi/mount/selinux/
+   zlib/orc，`-dev` 的 `.so` 是**悬空软链**。症状是编库成功、**编二进制时**一大片
+   `undefined reference`，一个都不点名真正的原因。`cross-sysroot.sh` 补了 8 个运行时包。
+3. **GNU ld 会检查共享库的未定义符号，lld 不查** —— 所以上游 `cargo board`（zigbuild/lld）
+   从没碰到；我们用 `-Wl,--allow-shlib-undefined`，符号在板上运行时解析。
+
+### 实测（2026-11-01）
+
+- 相机 1920×1080 传感器模式，输出 1280×720@30，`mpph264enc` 按 3.45 Mbps CBR 配好，
+  采率稳定 29.9–30.0 fps
+- `mediad::exposure` 的软件闭环在驱动传感器（开机 600 行 → 收敛到 1200 行 / 11× 增益上限）
+- `robotd health` 里能看到 `camera 30.0 fps … no viewer`
+- 每次开流都有一条 ERROR：`webrtcsink: Bitrate handling is not supported yet for mpph264enc`。
+  **不是故障**：它讲的是 webrtcsink 无法按拥塞反馈*动态*改码率，静态码率照样生效
+- 场景偏暗时曝光到顶（mean luma ≈ 74，目标 90）—— 灯亮一点或者调 `--exposure` 初始值
+
+### 还没做
+
+- `[detect]`（NPU 上的鸭子检测）要 `/dev/rknpu`，板上现在没有这个节点
+- **鉴权没有就是没有** —— 绑 `0.0.0.0`，源码原话「Anyone who reaches the signalling port can
+  drive the robot and see its camera」。只在内网用，别往公网映射
 
 它自己写着「**不在恢复路径上**」：mediad 起不来，鸭子照走、照能更新、照样能用蓝牙。
-所以它坏了随时停掉就行，不影响控制。
+坏了随时 `sudo systemctl disable --now mediad` 停掉，不影响控制。
 
 参考：`microduck/docs/design/remote-webrtc.md`、`microduck/docs/design/webrtc-console.md`。

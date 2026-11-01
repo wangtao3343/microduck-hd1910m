@@ -84,6 +84,13 @@ fn permits(call: &proto::Call) -> bool {
         // control-only session without video ever becomes a normal thing.
         RobotEnable(_) | RobotInit | RobotRelax => true,
 
+        // Clearing a latched fault is a superset of `robot.relax` — it drops torque first, so a
+        // standing robot falls, and only then revalidates the hardware and clears the latch. The
+        // same "the peer can watch" argument covers it, and more: the latch is what a robot stops
+        // answering after, so a console that can show a fault it cannot clear is a console that
+        // sends somebody to `robotctl` for the first question it raises.
+        RobotClearFault => true,
+
         // `robot.stop` is permitted here and refused over BLE, and the difference is honesty
         // rather than authority. BLE's objection was that a stop button over "an unbonded,
         // high-latency, sometimes-absent radio" is worse than no button because it *looks* like an

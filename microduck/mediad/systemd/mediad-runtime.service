@@ -1,0 +1,55 @@
+# mediad —— 板上 runtime 部署用的单元（不是 /opt/robot 那套）。
+#
+# 装到 /etc/systemd/system/mediad.service。
+# 与同目录的 mediad.service 的区别只在部署形态：那套用 User=mediad / Group=robot、
+# 二进制在 /opt/robot/daemon/current/bin；我们这套跑在 duck 用户的 workspace 下，
+# 配置和 robotd 的 socket 都在 local/。
+#
+# **socket 是不显式的那一个，和 padd 相反。** mediad 没有 `--socket` 参数，上游把
+# `/run/robotd.sock` 编在 `proto::socket::ROBOT` 里；我们的 robotd 在 `local/robotd.sock`。
+# 所以板子上要有一条 tmpfiles 规则把两者连起来（root 装一次）：
+#
+#   # /etc/tmpfiles.d/robotd-socket.conf
+#   L /run/robotd.sock - - - - /home/duck/workspace/microduck-hd1910m/local/robotd.sock
+#
+#   sudo systemd-tmpfiles --create /etc/tmpfiles.d/robotd-socket.conf
+#
+# 软链先于 robotd 建好也没关系：连接时目标是活的就行。
+#
+# 其余服务（configd / updaterd / padd / tofd）的 socket 不存在是可接受的 ——
+# 上游 Pool 按需连接，缺了只影响对应的那条调用，不影响视频和控制。
+
+[Unit]
+Description=MicroDuck media and WebRTC gateway (mediad)
+# robotd 是 control 通道的去处；它没起来时 mediad 照样要能起（Pipeline 不依赖它），
+# 连不上由 Restart=always 五秒后重试。
+After=microduck-hd1910.service
+Wants=microduck-hd1910.service
+
+[Service]
+Type=exec
+User=duck
+# video: /dev/mpp_service、/dev/rga、/dev/videoN
+# render: NPU（/dev/dri/renderD*）—— [detect] 打开时才用得上
+SupplementaryGroups=video render
+
+WorkingDirectory=/home/duck/workspace/microduck-hd1910m
+ExecStart=/home/duck/workspace/microduck-hd1910m/out/arm64/bin/mediad \
+    --config /home/duck/workspace/microduck-hd1910m/local/media.toml
+
+Restart=always
+RestartSec=5s
+
+# 插件装在 /usr/local/lib/gstreamer-1.0，GStreamer 默认不搜这里。
+# 少了这一行 mpph264enc 和 webrtcsink 都不存在，daemon 报一句就退出。
+Environment=GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0
+Environment=RUST_LOG=info
+
+RuntimeDirectory=mediad
+RuntimeDirectoryMode=0755
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

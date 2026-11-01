@@ -72,17 +72,26 @@ gstreamer-webrtc-1.0 gstreamer-sdp-1.0 libudev"
 # runtime package, so `-lfoo` on the link line needs both. That is why the GStreamer, GLib and
 # udev runtime packages are here.
 #
-# The rest are `-dev` only, and correctly so: pcre2, ffi, orc, zlib, mount, blkid, selinux and
-# sepol appear in `Requires.private`, which pkg-config needs to *resolve* but which never reaches
-# the link line of a dynamically linked binary. If one of them ever does, the symptom is
-# `unable to find dynamic system library` and the fix is its runtime package.
+# The rest also turned out to need their runtime half, for a reason that is not on the link line:
+# pcre2, ffi, orc, zlib, mount, blkid, selinux and sepol appear only in `Requires.private`, and
+# that is enough for pkg-config — but libglib and libgio carry `libpcre2-8.so.0`, `libffi.so.8`,
+# `libmount.so.1`, `libselinux.so.1`, `libz.so.1` and `liborc-0.4.so.0` in DT_NEEDED, and ld has
+# to read those to resolve the `pcre2_*`, `ffi_*`, `mnt_*`, `freecon`, `inflateGetHeader` and
+# `orc_*` symbols they pull in. With only the `-dev` packages present the `.so` symlinks dangle and
+# linking the *binary* (the library builds fine) fails with a wall of `undefined reference`, none
+# of it naming the cause. Cat the `.so` symlinks after a rebuild: any that dangle is a runtime
+# package to add here. `libgstwebrtc-1.0.so` also links gstgl, hence the two GStreamer runtime
+# packages at the end. Mind the t64 renames: `liborc-0.4-0t64`, and `libglib2.0-0t64` above.
 PACKAGES="libgstreamer1.0-dev libgstreamer1.0-0
 libgstreamer-plugins-base1.0-dev libgstreamer-plugins-base1.0-0
 libgstreamer-plugins-bad1.0-dev libgstreamer-plugins-bad1.0-0
 libgio-2.0-dev libglib2.0-dev libglib2.0-dev-bin libglib2.0-0t64
 libsysprof-capture-4-dev libpcre2-dev libffi-dev liborc-0.4-dev
 zlib1g-dev libmount-dev libblkid-dev libselinux1-dev libsepol-dev
-libudev-dev libudev1"
+libudev-dev libudev1
+libpcre2-8-0 libpcre2-16-0 libpcre2-32-0 libpcre2-posix3
+libffi8 liborc-0.4-0t64 zlib1g libmount1 libblkid1 libselinux1 libsepol2
+libgstreamer-gl1.0-0 libgstreamer-opencv1.0-0"
 
 say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
