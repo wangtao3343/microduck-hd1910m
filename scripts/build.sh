@@ -12,9 +12,10 @@ case "$MODE" in
     SUB=aarch64-unknown-linux-gnu/release ;;
   *) printf 'Usage: bash scripts/build.sh [native|arm64]\n' >&2; exit 2 ;;
 esac
-(cd "$ROOT/microduck" && cargo "${ARGS[@]}" -p robotd -p robotctl)
+(cd "$ROOT/microduck" && cargo "${ARGS[@]}" -p robotd -p robotctl -p voice)
 (cd "$ROOT/microduck_app/backend" && cargo "${ARGS[@]}")
 mkdir -p "$ROOT/out/$MODE/bin"
-install -m755 "$ROOT/microduck/target/$SUB/robotd" "$ROOT/microduck/target/$SUB/robotctl" "$ROOT/out/$MODE/bin/"
+install -m755 "$ROOT/microduck/target/$SUB/robotd" "$ROOT/microduck/target/$SUB/robotctl" \
+  "$ROOT/microduck/target/$SUB/duck-voice" "$ROOT/out/$MODE/bin/"
 install -m755 "$ROOT/microduck_app/backend/target/$SUB/microduck-app-server" "$ROOT/out/$MODE/bin/"
 printf 'Built %s\n' "$ROOT/out/$MODE/bin"

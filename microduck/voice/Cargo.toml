@@ -1,0 +1,25 @@
+# Record a voice memo on the onboard microphone and play it back through the speaker.
+#
+# Two halves that the rest of the workspace only had one of: `robotd/src/sound.rs` already
+# spawns `aplay` to play the sound bank, but nothing anywhere *records*. The microphone itself
+# is plain ALSA (`arecord`/`aplay`, the same way `pet-detect` reads it), so this crate adds no
+# audio dependency — only the cleanup that makes the recording listenable.
+[package]
+name = "voice"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "voice"
+
+[[bin]]
+name = "duck-voice"
+path = "src/bin/duck_voice.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { workspace = true, features = ["derive"] }
+hound.workspace = true
+tracing.workspace = true
