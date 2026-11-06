@@ -102,6 +102,16 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Float,
         "EMA smoothing on head targets, 1.0 = pass-through",
     ),
+    entry(
+        "control.home_ramp_ms",
+        Kind::Integer,
+        "Start's ramp to the home pose, ms (the visible bring-up)",
+    ),
+    entry(
+        "control.downed_ramp_ms",
+        Kind::Integer,
+        "The same ramp when brought up from off its feet, ms",
+    ),
     // ── [update_gate] ────────────────────────────────────────────────────────
     entry(
         "update_gate.min_achieved_hz",
@@ -249,7 +259,12 @@ pub const REGISTRY: &[Entry] = &[
     entry(
         "safety.battery_warn_v",
         Kind::Float,
-        "Bus volts below which the robot says so out loud; 0 disables",
+        "Bus volts below which the duck says the battery is low; 0 disables",
+    ),
+    entry(
+        "safety.battery_critical_v",
+        Kind::Float,
+        "Bus volts below which the duck says to charge immediately; 0 disables",
     ),
     feature(
         "safety.bus_auto_recover",
@@ -378,6 +393,11 @@ pub const REGISTRY: &[Entry] = &[
     ),
     entry("audio.device", Kind::Text, "ALSA playback device"),
     entry("audio.bank", Kind::Text, "Voice bank directory"),
+    entry(
+        "audio.prompts",
+        Kind::Text,
+        "Fixed spoken-prompt directory (boot.wav, battery_low.wav, ...)",
+    ),
     feature(
         "audio.greet",
         Kind::Bool,

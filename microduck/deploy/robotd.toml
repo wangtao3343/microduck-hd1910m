@@ -40,6 +40,17 @@ hz = 50
 # cmd_alpha = 0.2
 # head_alpha = 0.2
 
+# How long Start's ramp to the home pose takes, in milliseconds. This is the visible
+# bring-up: torque on, joints interpolate from wherever they are to home, then the policy may
+# drive. 2000 now; the original 4000 was picked when every overcurrent shutdown came from a
+# joint travelling fast, and the operator has asked for a shorter wait twice since. Nothing
+# measures current — if a bring-up looks jerky or trips a servo, raise this rather than
+# touching a gain. `downed_ramp_ms` is the same ramp from off the robot's feet (tipped,
+# prone, on its side), where the joints have further to travel. Values under one second are
+# floored there.
+# home_ramp_ms = 2000
+# downed_ramp_ms = 4000
+
 [update_gate]
 # What decides `healthy`, and therefore what the update system rolls back on.
 #
@@ -256,18 +267,23 @@ mode = "walk"
 # ~10 s, so a load sag cannot trip it; reaching 6.6 requires a genuinely spent pack.
 # battery_empty_shutdown = true
 
-# Say so out loud — one `alarm` from the voice bank, repeated about every 30 s — when the
-# motor bus sags below this many volts. Zero disables it.
+# Say so out loud when the motor bus sags — two tiers, two sentences. Both are read from
+# the raw one-per-second bus sample, not the ten-second EMA above: the failure worth hearing
+# about is a pack that cannot hold up under a servo-heavy move, and an EMA that slow is what
+# smooths one away. Two samples in a row past a threshold before it counts; each tier clears
+# after two samples 0.1 V back above its line. A tier repeats about every 30 s while it
+# lasts, and falling from the first into the second speaks at once. Zero disables a tier.
+# It is only a warning — nothing is commanded, nothing is stopped.
 #
-# This reads the raw one-per-second bus sample, not the ten-second EMA above: the failure
-# worth hearing about is a pack that cannot hold up under a servo-heavy move, and an EMA
-# that slow is what smooths one away. Two samples in a row below the threshold before it
-# counts. It is only a warning — nothing is commanded, nothing is stopped.
-#
-# 7.5 V is about 56% on the linear scale, and it is that high on purpose: the packs that
-# failed to stand the robot up read 7.38–7.43 V, so the usual "nearly empty" threshold would
-# speak only after the duck had already gone quiet.
-# battery_warn_v = 7.5
+# 7.4 V is 3.70 V per cell and about 50% on the linear scale: the nominal Li-ion voltage,
+# where normal practice is to head for a charger. This is also exactly where the packs that
+# failed to stand this robot up sat (7.38–7.43 V), so it is not early.
+# 7.0 V is 3.50 V per cell, the knee of the discharge curve. Below 3.0 V per cell (6.0 V for
+# this 2S pack) the cells are over-discharged and lose capacity, so this is the last call
+# that still leaves time to stop and plug in.
+# Set `battery_critical_v` below `battery_warn_v`.
+# battery_warn_v = 7.4
+# battery_critical_v = 7.0
 
 # Clear a latched bus fault without waiting for somebody to hold D-pad left.
 #
@@ -296,6 +312,15 @@ mode = "walk"
 
 # Where the voice bank lives.
 # bank = "/var/lib/robot/sounds"
+
+# Where the fixed spoken prompts live: boot.wav, policy_enabling.wav, policy_enabled.wav,
+# policy_paused.wav, relax.wav, battery_low.wav, battery_critical.wav, fault_reset.wav,
+# shutdown.wav, battery_empty.wav.
+# These are sentences, not bank variants — one known file per event, played verbatim. Kept
+# outside the bank because `sounds ensure-bank` replaces that directory. A missing file
+# falls back to the duck call that event used before, so an unprovisioned board is only
+# quiet if it was quiet already.
+# prompts = "/var/lib/robot/prompts"
 
 # Quack once as the control loop comes up — on a headless board that greet is the audible
 # "robotd is running". Turn it off (and keep the triggers, and the mic) if you restart the

@@ -86,25 +86,31 @@ const STATE_BUFFER: usize = 256;
 /// ([`publish_slow_sensors`]).
 const RATE_WINDOW: Duration = Duration::from_secs(1);
 
-/// How long the ramp to the home pose takes when the policy is first enabled.
+/// The shortest bring-up ramp the loop will run, whatever `control.home_ramp_ms` says.
 ///
-/// Four seconds, not the two `robotd init` used: on this pack — 7.4 V under load, and every
-/// overcurrent shutdown so far has come from a joint asked to travel fast — the slower ramp
-/// is the one that keeps the servos inside their current budget. Chosen by the operator as
-/// "4–5 s should be enough"; nothing here measures current, so if a bring-up still trips a
-/// servo this is the number to raise.
-const HOME_RAMP: Duration = Duration::from_secs(4);
+/// A zero would make `homing_target` return `None` on its first tick — an instant step that
+/// hands the policy the pose the ramp exists to leave behind. One second is a floor, not a
+/// recommendation.
+const RAMP_FLOOR: Duration = Duration::from_secs(1);
 
-/// How long the ramp takes when the robot is brought up from off its feet — tipped, lying
-/// prone, or on its side.
+/// The configured ramp to the home pose when Start brings the robot up from roughly
+/// standing, floored at [`RAMP_FLOOR`]. This is the whole visible bring-up: torque on, joints
+/// interpolate to home, then the policy may drive.
+fn home_ramp(params: &Params) -> Duration {
+    Duration::from_millis(params.control.home_ramp_ms).max(RAMP_FLOOR)
+}
+
+/// The same from off the robot's feet — tipped, lying prone, or on its side.
 ///
-/// A little longer than [`HOME_RAMP`] because the joints have further to travel: a robot on
-/// the floor starts with its legs folded or splayed, so the same duration would mean a
-/// visibly faster joint speed, exactly the case where the pack sags and a servo trips. It
-/// stays a ramp rather than the getup network for the operator's sake: the network's rise is
-/// a fast bang-bang motion they can do nothing about mid-way, and this is the smooth one
-/// they already know from a Start after a relax.
-const DOWNED_RAMP: Duration = Duration::from_secs(5);
+/// Its own setting because the joints have further to travel: a robot on the floor starts
+/// folded or splayed, so the home duration would mean a visibly faster joint speed, exactly
+/// the case where the pack sags and a servo trips. It stays a ramp rather than the getup
+/// network for the operator's sake: the network's rise is a bang-bang motion they can do
+/// nothing about mid-way, and this is the smooth one they already know from a Start after a
+/// relax.
+fn downed_ramp(params: &Params) -> Duration {
+    Duration::from_millis(params.control.downed_ramp_ms).max(RAMP_FLOOR)
+}
 
 /// How many chirps announce that a ramp has reached home, and how far apart they are.
 ///
@@ -114,10 +120,19 @@ const RAMP_CHIRPS: u8 = 3;
 const RAMP_CHIRP_GAP: Duration = Duration::from_millis(350);
 
 /// How far the farthest joint may sit from home before an enable's return to home is worth
-/// a ramp. Under three degrees: the ramp would spend [`HOME_RAMP`] travelling a distance
-/// the servos cover in a couple of ticks, and the operator would hear the bring-up
-/// announcement for a robot that never moved.
-const HOME_RETURN_DEADBAND: f64 = 0.05;
+/// a ramp. The ramp would spend its whole duration travelling a distance the servos cover in
+/// a couple of ticks, and the operator would hear the bring-up announcement for a robot that
+/// never moved.
+///
+/// Set from measurement, not taste. A robot standing still at home reads 0.037 rad off its
+/// home command on the knees — servo compliance under the robot's own weight, not a pose to
+/// travel — and less margin on a sagging pack. The old 0.05 rad (2.9°) sat inside that noise,
+/// so every enable decided the robot was away from home and spent two seconds ramping at the
+/// pose it was already in: the operator just pressed Start and heard "正在开启策略", a pause,
+/// then "策略开启成功". 0.15 rad (8.6°) is well clear of the standing error and still far
+/// below a genuinely displaced pose (a pause mid-stride, a crouch), which is what the ramp is
+/// for.
+const HOME_RETURN_DEADBAND: f64 = 0.15;
 
 /// Smoothing on the reported battery voltage. At one sample per [`RATE_WINDOW`] this is a
 /// ~10 s time constant, which is what makes the number readable: the raw voltage sags
@@ -126,21 +141,50 @@ const HOME_RETURN_DEADBAND: f64 = 0.05;
 /// `microduck_runtime`.
 const BATTERY_EMA_ALPHA: f64 = 0.1;
 
-/// Raw samples in a row below `safety.battery_warn_v` before the robot says so out loud.
-/// At one sample per [`RATE_WINDOW`] that is about two seconds — long enough to outlast a
-/// single dropped transaction, short enough that the operator hears about a sag while the
-/// duck is still doing the thing that caused it.
+/// Raw samples in a row past a warning threshold before the robot says so out loud. At one
+/// sample per [`RATE_WINDOW`] that is about two seconds — long enough to outlast a single
+/// dropped transaction, short enough that the operator hears about a sag while the duck is
+/// still doing the thing that caused it. Each tier has its own counter.
 const BATTERY_WARN_SAMPLES: u32 = 2;
 
-/// Volts above `safety.battery_warn_v` a pack has to climb before the warning clears. Without
-/// it, a pack resting on the threshold flaps the latch on alternate samples, and every re-arm
-/// speaks at once — [`BATTERY_WARN_REPEAT`] never gets a chance to apply and the duck becomes
-/// the only thing you can hear.
+/// Volts above a threshold a pack has to climb before that tier clears. Without it, a pack
+/// resting on the line flaps the latch on alternate samples, and every re-arm speaks at
+/// once — [`BATTERY_WARN_REPEAT`] never gets a chance to apply and the duck becomes the only
+/// thing you can hear.
 const BATTERY_WARN_CLEAR_MARGIN: f64 = 0.1;
 
-/// How often the low-pack warning repeats while it stays low. Frequent enough to hear over
-/// the motors, rare enough not to be the only thing the duck ever says.
+/// How often a low-pack warning repeats while it stays at that tier. Frequent enough to
+/// hear over the motors, rare enough not to be the only thing the duck ever says.
 const BATTERY_WARN_REPEAT: Duration = Duration::from_secs(30);
+
+/// Which of the two low-pack tiers is currently latched.
+///
+/// Ordered, so "higher" is always "closer to needing the charger" and a recovery is a
+/// step down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum BatteryLevel {
+    Normal,
+    Low,
+    Critical,
+}
+
+impl BatteryLevel {
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::Low,
+            2 => Self::Critical,
+            _ => Self::Normal,
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::Normal => 0,
+            Self::Low => 1,
+            Self::Critical => 2,
+        }
+    }
+}
 
 /// How long the shutdown sit gets before torque is cut and the machine powers off, when no
 /// controller is there to say. The sitstand descent is a deliberate ~2 s glide; the prototype
@@ -199,7 +243,7 @@ const SEATED_BOOT_RAD: f64 = 0.30;
 /// a robot substantially upside down — while a duck lying on its side reads as upright there
 /// (projected gravity near zero) and is exactly the robot a two-second ramp to the home pose
 /// cannot be given. 45° is the angle at which "it will stand up by itself" stops being true
-/// of a duck: from there a bring-up takes [`DOWNED_RAMP`] instead of [`HOME_RAMP`].
+/// of a duck: from there a bring-up takes the downed ramp instead of the home one.
 fn tipped_over(gravity: &[f64; 3]) -> bool {
     // Normalised, and not merely read, because an orientation filter that has not converged
     // reports a zero vector — which would divide to "0 < 0.707" and send a standing robot
@@ -215,6 +259,43 @@ fn farthest_from(positions: &[f64; NUM_JOINTS], home: &[f64; NUM_JOINTS]) -> f64
         .zip(home)
         .map(|(now, want)| (now - want).abs())
         .fold(0.0, f64::max)
+}
+
+/// How long the duck's own call keeps the codec before a spoken prompt cuts it in.
+///
+/// The longest chirp in the bank is 0.23 s, and the codec plays one sound at a time: a new
+/// play kills the previous child. So "quack, then speak" is two plays a fixed gap apart —
+/// long enough that the call is heard whole, short enough that the pause does not read as
+/// one of its own.
+const QUACK_LEAD: Duration = Duration::from_millis(300);
+
+/// A spoken prompt waiting for its quack to finish: when, what, and what to fall back to if
+/// the prompt wav is missing.
+type SpeechQueue = Option<(Instant, String, Option<&'static str>)>;
+
+/// Play a prompt the way the robot talks: its own call first, the sentence after it.
+///
+/// Every operator-facing sentence goes through here rather than straight to
+/// [`sound::Sound::play_prompt`], which is what makes the quack consistent — the same chirp
+/// the right trigger plays — instead of something each call site has to remember. A blocking
+/// prompt (the goodbye before power-off) waits out the gap here; everything else queues and
+/// the control loop plays it on a later tick, because blocking the 50 Hz loop for a quack
+/// would be absurd.
+fn speak(
+    voice: &mut Option<sound::Sound>,
+    queue: &mut SpeechQueue,
+    name: &str,
+    fallback: Option<&'static str>,
+    blocking: bool,
+) {
+    let Some(voice) = voice.as_mut() else { return };
+    voice.play("chirp", false);
+    if blocking {
+        std::thread::sleep(QUACK_LEAD);
+        voice.play_prompt(name, fallback, true);
+    } else {
+        *queue = Some((Instant::now() + QUACK_LEAD, name.to_owned(), fallback));
+    }
 }
 
 /// Where the limp-fall sequence is (`[safety] limp_fall`).
@@ -605,14 +686,15 @@ struct RobotState {
     /// distinction that has to survive to the wire, since zero volts and unknown volts look
     /// nothing alike to whoever is deciding whether to charge the robot.
     battery_v: AtomicU64,
-    /// Latched low-pack warning, set from the *raw* once-a-second bus sample against
-    /// `safety.battery_warn_v`. Distinct from the EMA above on purpose: a pack that sags
-    /// under a servo-heavy move is exactly what the EMA hides. The loop reads this to make
-    /// the robot say so out loud.
-    battery_low: AtomicBool,
-    /// Consecutive raw samples below the threshold. Debounce, so one noisy read cannot
-    /// start the duck shouting.
+    /// Latched low-pack tier, set from the *raw* once-a-second bus sample against
+    /// `safety.battery_warn_v` and `safety.battery_critical_v`. Distinct from the EMA above
+    /// on purpose: a pack that sags under a servo-heavy move is exactly what the EMA hides.
+    /// The loop reads this to decide which sentence to speak and when to repeat it.
+    battery_level: AtomicU8,
+    /// Consecutive raw samples at that tier's entry side. One debounce counter per tier, so
+    /// one noisy read cannot start the duck shouting.
     battery_low_run: AtomicU32,
+    battery_critical_run: AtomicU32,
     /// Hottest servo of the last thermal sample: temperature as `f64::to_bits`, and which
     /// joint it was. Zero means *not read yet*, same as the battery.
     motor_max_c: AtomicU64,
@@ -745,8 +827,9 @@ impl RobotState {
             #[cfg(target_os = "linux")]
             native_imu: ArcSwapOption::empty(),
             battery_v: AtomicU64::new(0),
-            battery_low: AtomicBool::new(false),
+            battery_level: AtomicU8::new(BatteryLevel::Normal.code()),
             battery_low_run: AtomicU32::new(0),
+            battery_critical_run: AtomicU32::new(0),
             motor_max_c: AtomicU64::new(0),
             motor_mean_c: AtomicU64::new(0),
             motor_hottest: AtomicU32::new(0),
@@ -1409,9 +1492,9 @@ enum Bringup {
     Homing {
         from: [f64; NUM_JOINTS],
         since: Instant,
-        /// How long this ramp takes. [`HOME_RAMP`] from roughly standing, [`DOWNED_RAMP`]
-        /// from the floor. Carried in the state rather than recomputed, because the tick
-        /// that measures it is not the tick that watches it run.
+        /// How long this ramp takes. The configured home ramp from roughly standing, the
+        /// longer downed one from the floor. Carried in the state rather than recomputed,
+        /// because the tick that measures it is not the tick that watches it run.
         ramp: Duration,
     },
     /// At the home pose with torque on. The policy drives when enabled.
@@ -1941,7 +2024,7 @@ async fn control_loop<T: RobotIo>(
     let mut last_summary = Instant::now();
     // When the low-pack warning last spoke, so a sag that lasts does not turn into a duck
     // that never stops shouting. `None` means it has not spoken since the last recovery.
-    let mut last_low_alarm: Option<Instant> = None;
+    let mut last_battery_alarm: Option<Instant> = None;
     let mut was_driving = false;
     // Whether a scripted move was running the networks last tick, independent of the walk
     // policy. The two are separate because a getup runs on a robot whose policy is stopped.
@@ -2012,7 +2095,13 @@ async fn control_loop<T: RobotIo>(
     let mut voice = params
         .audio
         .enabled
-        .then(|| sound::Sound::new(params.audio.bank.clone(), params.audio.device.clone()));
+        .then(|| {
+            sound::Sound::new(
+                params.audio.bank.clone(),
+                params.audio.prompts.clone(),
+                params.audio.device.clone(),
+            )
+        });
     let pet: Option<pet_detect::worker::PetHandle> = if params.audio.enabled
         && params.audio.pet_detect_resolved(params.policy.mode)
         && let Some(model) = params.audio.pet_model_resolved()
@@ -2084,13 +2173,16 @@ async fn control_loop<T: RobotIo>(
     // own switch, because the reason to want it gone (restarting the daemon all day) is
     // not a reason to give up the triggers and the mic that `audio.enabled = false` takes
     // with it.
-    if let Some(voice) = voice.as_mut()
-        && params.audio.greet
-    {
-        voice.play("greet", false);
+    let mut speech: SpeechQueue = None;
+    if params.audio.greet {
+        speak(&mut voice, &mut speech, "boot", Some("greet"), false);
     }
 
     let mut reference_running = false;
+    // An enable was asked for and the policy has not started driving yet. The success
+    // sentence belongs to the tick it actually drives, not to the request — and a disable
+    // before that moment means it is never said.
+    let mut policy_on_pending = false;
     // Automatic recovery from a latched bus fault — see `[safety] bus_auto_recover`.
     // The wait is config in milliseconds and the loop counts ticks, so the two are
     // reconciled once, here, rather than a tick count being written into a config file
@@ -2104,6 +2196,16 @@ async fn control_loop<T: RobotIo>(
     while !state.shutdown.load(Ordering::Relaxed) {
         ticker.tick().await;
         let tick_start = Instant::now();
+        // A queued prompt whose quack has had its say. Played here, at the top of a tick, so
+        // the sentence starts at the same point in the call every time.
+        if let Some((at, _, _)) = speech.as_ref()
+            && *at <= tick_start
+        {
+            let (_, name, fallback) = speech.take().expect("just matched");
+            if let Some(voice) = voice.as_mut() {
+                voice.play_prompt(&name, fallback, false);
+            }
+        }
         let home = controller.as_ref().map(Controller::home).unwrap_or(DEFAULT_POSITION);
 
         if let Some(reply) = intents.take_fault_reset() {
@@ -2169,9 +2271,12 @@ async fn control_loop<T: RobotIo>(
                     intents.take_power_request();
                     intents.stop();
                     match safety.clear_fault() {
-                        Ok(()) => tracing::warn!(
-                            "automatic fault reset: bus back, torque off — press Start to resume"
-                        ),
+                        Ok(()) => {
+                            tracing::warn!(
+                                "automatic fault reset: bus back, torque off — press Start to resume"
+                            );
+                            speak(&mut voice, &mut speech, "fault_reset", None, false);
+                        }
                         Err(error) => {
                             tracing::warn!(error = %error, "automatic fault reset failed")
                         }
@@ -2204,22 +2309,37 @@ async fn control_loop<T: RobotIo>(
         if intents.take_home_request() && policy_cfg.reference_native {
             intents.stop();
             reference_running = false;
+            policy_on_pending = true;
             if bringup == Bringup::Ready && let Some(sensors) = sensors.as_ref() {
                 // Enabling the policy asks for this return to home, and a Start on a robot
                 // that is already standing at home used to spend four seconds ramping at a
                 // pose it was already in — then announce a bring-up that never happened.
                 // Nothing to travel, nothing to wait for: stay `Ready` and let the policy
                 // drive on the next tick. A robot genuinely away from home still ramps.
-                if farthest_from(&sensors.positions, &home) > HOME_RETURN_DEADBAND {
+                let deviation = farthest_from(&sensors.positions, &home);
+                if deviation > HOME_RETURN_DEADBAND {
+                    // Worth a line: this is the one enable path that looks, to the operator,
+                    // like the robot standing up again instead of the policy starting.
+                    tracing::warn!(
+                        deviation = format!("{deviation:.3}"),
+                        "enable: returning to home before the policy drives"
+                    );
                     bringup = Bringup::Homing {
                         from: sensors.positions,
                         since: tick_start,
-                        ramp: HOME_RAMP,
+                        ramp: home_ramp(&params),
                     };
+                    // There is a ramp to wait through, so say what is happening now. From
+                    // home the policy drives on this very tick and only the success
+                    // sentence is worth hearing — two here would cut each other off.
+                    speak(&mut voice, &mut speech, "policy_enabling", Some("chirp"), false);
                 }
             }
         }
         let snapshot = intents.snapshot();
+        if !snapshot.enabled {
+            policy_on_pending = false;
+        }
         if (policy_cfg.supported_m6 || policy_cfg.reference_native) && intents.take_manual_stop() {
             reference_running = false;
             if let Some(controller) = controller.as_mut() { controller.cancel_manual_step(); }
@@ -2258,7 +2378,7 @@ async fn control_loop<T: RobotIo>(
                         // where the robot lies — but bring-up itself no longer takes it
                         // unasked.
                         let downed = tipped_over(&sensors.imu.gravity);
-                        let ramp = if downed { DOWNED_RAMP } else { HOME_RAMP };
+                        let ramp = if downed { downed_ramp(&params) } else { home_ramp(&params) };
                         tracing::warn!(?ramp, downed, "robot.init: torque on, ramping to home");
                         bringup = Bringup::Homing {
                             from: sensors.positions,
@@ -2273,11 +2393,14 @@ async fn control_loop<T: RobotIo>(
                 // mid-crouch must not hand the policy that crouch as its starting pose.
                 // The policy holds off while Homing runs and resumes at Ready.
                 (Bringup::Ready, Some(sensors)) => {
-                    tracing::warn!(?HOME_RAMP, "robot.init: re-homing from the current pose");
+                    tracing::warn!(
+                        ramp_ms = params.control.home_ramp_ms,
+                        "robot.init: re-homing from the current pose"
+                    );
                     bringup = Bringup::Homing {
                         from: sensors.positions,
                         since: tick_start,
-                        ramp: HOME_RAMP,
+                        ramp: home_ramp(&params),
                     };
                 }
                 // Mid-ramp, or no sample to ramp from: nothing to do, and saying so beats
@@ -2287,6 +2410,11 @@ async fn control_loop<T: RobotIo>(
             Some(intents::PowerRequest::Relax) => match safety.set_torque(false) {
                 Ok(()) => {
                     tracing::warn!("robot.relax: torque off");
+                    // Said out loud, and before the joints go slack rather than after: the
+                    // duck announces that it is the one letting go, so a collapse is not read
+                    // as a fault. The codec is on its own supply, so the sentence still
+                    // finishes while the servos are limp.
+                    speak(&mut voice, &mut speech, "relax", Some("coo"), false);
                     // Back to the start, so the next `init` or Start ramps from wherever the robot
                     // ends up rather than assuming it is still at the home pose.
                     bringup = Bringup::Limp;
@@ -2449,7 +2577,7 @@ async fn control_loop<T: RobotIo>(
                     bringup = Bringup::Homing {
                         from: sensors.positions,
                         since: tick_start,
-                        ramp: HOME_RAMP,
+                        ramp: home_ramp(&params),
                     };
                 }
             }
@@ -2516,7 +2644,7 @@ async fn control_loop<T: RobotIo>(
                                 bringup = Bringup::Homing {
                                     from: sensors.positions,
                                     since: tick_start,
-                                    ramp: HOME_RAMP,
+                                    ramp: home_ramp(&params),
                                 };
                             }
                         } else {
@@ -2550,16 +2678,18 @@ async fn control_loop<T: RobotIo>(
             && battery_v > 0.0
             && battery_v <= duck_control::model::BATTERY_EMPTY_V;
         if !powered_off && shutdown_sit.is_none() && (intents.take_shutdown() || battery_empty) {
+            // A spoken goodbye says *why* the duck is going down; the bank's peck remains the
+            // fallback when no prompt set is installed, so an unprovisioned board sounds
+            // exactly as it did.
+            let goodbye = if battery_empty { "battery_empty" } else { "shutdown" };
             let can_sit = snapshot.enabled
                 && bringup == Bringup::Ready
                 && !safety.fallen()
                 && controller.as_ref().is_some_and(|c| c.has_sitstand());
             if can_sit {
                 tracing::warn!(battery_empty, "shutdown: sitting down before power off");
-                // Goodbye peck; non-blocking — it plays out during the sit.
-                if let Some(voice) = voice.as_mut() {
-                    voice.play("peck", false);
-                }
+                // Goodbye prompt; non-blocking — it plays out during the sit.
+                speak(&mut voice, &mut speech, goodbye, Some("peck"), false);
                 controller
                     .as_mut()
                     .expect("can_sit checked the controller")
@@ -2568,11 +2698,9 @@ async fn control_loop<T: RobotIo>(
             } else {
                 tracing::warn!(battery_empty, "shutdown: cutting torque and powering off");
                 cut_torque_before_poweroff(&mut safety);
-                // Goodbye peck; blocking, so it is heard before the poweroff kills this
+                // Goodbye prompt; blocking, so it is heard before the poweroff kills this
                 // process's cgroup. The one deliberate block in the loop, on its last tick.
-                if let Some(voice) = voice.as_mut() {
-                    voice.play("peck", true);
-                }
+                speak(&mut voice, &mut speech, goodbye, Some("peck"), true);
                 intents.set_enabled(false);
                 bringup = Bringup::Limp;
                 powered_off = true;
@@ -2785,7 +2913,7 @@ async fn control_loop<T: RobotIo>(
                     // robot) nor the getup network (bang-bang, and nothing the operator can
                     // slow down on a tired pack).
                     let downed = tipped_over(&sensors.imu.gravity);
-                    let ramp = if downed { DOWNED_RAMP } else { HOME_RAMP };
+                    let ramp = if downed { downed_ramp(&params) } else { home_ramp(&params) };
                     tracing::warn!(
                         ?ramp,
                         downed,
@@ -2796,6 +2924,7 @@ async fn control_loop<T: RobotIo>(
                         since: tick_start,
                         ramp,
                     };
+                    speak(&mut voice, &mut speech, "policy_enabling", Some("chirp"), false);
                 }
                 // Reported, not fatal, and it stays `Limp` so the next tick tries again: a bus that
                 // dropped one transaction is ordinary, and a robot that refused to ever come up
@@ -2851,13 +2980,23 @@ async fn control_loop<T: RobotIo>(
             tracing::warn!("at the home pose; the policy has the robot");
             bringup = Bringup::Ready;
             hold = home;
-            // Three chirps: the operator hears that the bring-up is over without looking at
-            // the robot or a log. The first here, the other two on later ticks.
-            if let Some(voice) = voice.as_mut() {
-                voice.play("chirp", false);
+            if policy_on_pending {
+                // The enable that asked for this ramp finishes here: say so in words, and
+                // skip the chirps — they would cut the sentence off. Any chirp still queued
+                // from an earlier bring-up goes with them.
+                policy_on_pending = false;
+                ramp_calls_left = 0;
+                next_ramp_call = None;
+                speak(&mut voice, &mut speech, "policy_enabled", Some("chirp"), false);
+            } else {
+                // Three chirps: the operator hears that the bring-up is over without looking
+                // at the robot or a log. The first here, the other two on later ticks.
+                if let Some(voice) = voice.as_mut() {
+                    voice.play("chirp", false);
+                }
+                ramp_calls_left = RAMP_CHIRPS - 1;
+                next_ramp_call = Some(tick_start + RAMP_CHIRP_GAP);
             }
-            ramp_calls_left = RAMP_CHIRPS - 1;
-            next_ramp_call = Some(tick_start + RAMP_CHIRP_GAP);
         }
 
         // The rest of the announcement, one chirp per gap. Nothing here waits: a tick that
@@ -3004,6 +3143,12 @@ async fn control_loop<T: RobotIo>(
             && !powered_off;
 
         if driving && !was_driving {
+            if policy_on_pending {
+                // Enabled while already standing at home: there was no ramp to announce at,
+                // so the success sentence belongs to the tick the policy actually drives.
+                policy_on_pending = false;
+                speak(&mut voice, &mut speech, "policy_enabled", Some("chirp"), false);
+            }
             // Starting fresh: a stale previous action in the observation, or a filter
             // anchored to where the robot was a minute ago, would both show up as a lurch.
             //
@@ -3025,6 +3170,11 @@ async fn control_loop<T: RobotIo>(
                 // ramp: the servos do the travel at their own speed, and the robot is
                 // standing at home when Start next hands it to the policy.
                 hold = home;
+                // Not during a power-off: there the goodbye is already playing, and the flag
+                // clearing there is not an operator asking to pause.
+                if !powered_off {
+                    speak(&mut voice, &mut speech, "policy_paused", Some("chirp"), false);
+                }
             } else {
                 // Any other stop — IMU cooling, a blind bus, the armed fall gate — freezes
                 // where the robot *is*, from the last sample that arrived. Captured once,
@@ -3446,23 +3596,36 @@ async fn control_loop<T: RobotIo>(
             window_start = Instant::now();
             window_ticks = 0;
 
-            publish_slow_sensors(&mut safety, &state, params.safety.battery_warn_v);
+            let battery_escalation = publish_slow_sensors(
+                &mut safety,
+                &state,
+                params.safety.battery_warn_v,
+                params.safety.battery_critical_v,
+            );
 
             // The low pack is the one failure that looks like every other one from the
             // operator's side — the duck just stops answering — so say it in the duck's own
             // voice instead of only in a log nobody is reading next to a robot on the floor.
             // Nothing is commanded: this is a warning, and the robot keeps doing whatever it
             // was asked to do.
-            if state.battery_low.load(Ordering::Relaxed) {
-                let due = last_low_alarm.is_none_or(|at| at.elapsed() >= BATTERY_WARN_REPEAT);
-                if due {
-                    last_low_alarm = Some(Instant::now());
-                    if let Some(voice) = voice.as_mut() {
-                        voice.play("alarm", false);
-                    }
-                }
+            //
+            // A step up the ladder (low → critical) speaks at once; a step down (critical
+            // → low, on recovery) speaks in the softer sentence at the next repeat.
+            let level = BatteryLevel::from_code(state.battery_level.load(Ordering::Relaxed));
+            if level == BatteryLevel::Normal {
+                last_battery_alarm = None;
             } else {
-                last_low_alarm = None;
+                let escalated = battery_escalation == Some(level);
+                let due = escalated
+                    || last_battery_alarm.is_none_or(|at| at.elapsed() >= BATTERY_WARN_REPEAT);
+                if due {
+                    last_battery_alarm = Some(Instant::now());
+                    let prompt = match level {
+                        BatteryLevel::Critical => "battery_critical",
+                        _ => "battery_low",
+                    };
+                    speak(&mut voice, &mut speech, prompt, Some("alarm"), false);
+                }
             }
 
             if last_summary.elapsed() >= LOOP_SUMMARY_INTERVAL {
@@ -3592,7 +3755,15 @@ fn limit_name(limit: duck_control::safety::Limit) -> &'static str {
 /// the bus: a transaction issued from the IPC side would interleave bytes with a tick and
 /// corrupt both. The IMU counters come from the same `io`, so they are mirrored here rather
 /// than reached for from the socket.
-fn publish_slow_sensors<T: RobotIo>(io: &mut Safety<T>, state: &RobotState, battery_warn_v: f64) {
+///
+/// Returns the battery tier when this sample just escalated into it, so the loop can speak
+/// without waiting out [`BATTERY_WARN_REPEAT`]; `None` when nothing changed.
+fn publish_slow_sensors<T: RobotIo>(
+    io: &mut Safety<T>,
+    state: &RobotState,
+    battery_warn_v: f64,
+    battery_critical_v: f64,
+) -> Option<BatteryLevel> {
     let stale = io.imu_stale();
     state.imu_stale_blocks.store(stale.total, Ordering::Relaxed);
     state.imu_stale_run.store(stale.run, Ordering::Relaxed);
@@ -3619,11 +3790,15 @@ fn publish_slow_sensors<T: RobotIo>(io: &mut Safety<T>, state: &RobotState, batt
 
             // The low-pack warning reads `slow.volts`, not `smoothed`: the whole point is a
             // sag under load, and the EMA above is precisely what would swallow it.
-            if track_battery_warning(state, slow.volts, battery_warn_v) {
+            let escalating =
+                track_battery_warning(state, slow.volts, battery_warn_v, battery_critical_v);
+            if let Some(level) = escalating {
                 tracing::warn!(
                     volts = slow.volts,
                     warn_v = battery_warn_v,
-                    "battery low — telling the operator"
+                    critical_v = battery_critical_v,
+                    ?level,
+                    "battery warning — telling the operator"
                 );
             }
 
@@ -3642,63 +3817,103 @@ fn publish_slow_sensors<T: RobotIo>(io: &mut Safety<T>, state: &RobotState, batt
                 .motor_mean_c
                 .store(mean_c.to_bits(), Ordering::Relaxed);
             state.motor_hottest.store(hottest as u32, Ordering::Relaxed);
+            escalating
         }
         // Keep the last sample. A single failed transaction is ordinary on a serial bus, and
         // dropping to "unknown" over one would make the reported battery flicker. A bus that
         // is really gone already shows up in the verdict and in `bus.consecutive_errors`.
-        Err(e) => tracing::debug!(error = %e, "slow-sensor read failed; keeping the last sample"),
+        Err(e) => {
+            tracing::debug!(error = %e, "slow-sensor read failed; keeping the last sample");
+            None
+        }
     }
 }
 
-/// Fold one raw bus voltage into the low-pack latch. Returns true on the sample the warning
-/// newly turns on, which is the one worth a log line; the loop separately uses the latch
-/// itself to decide when to speak and when to repeat.
+/// Fold one raw bus voltage into the two low-pack latches, and report a tier the sample just
+/// climbed into (the one worth a log line and an immediate sentence); `None` on a hold or a
+/// recovery.
 ///
 /// On the raw sample and not the EMA, because the failure this exists for is a pack sagging
 /// under a servo-heavy move — exactly what a ten-second average removes. Two samples in a
-/// row before it arms, so one dropped transaction cannot start the duck shouting.
+/// row before a tier arms, so one dropped transaction cannot start the duck shouting.
 ///
-/// Clearing is not the mirror image of arming: it takes two samples at or above `warn_v` plus
-/// [`BATTERY_WARN_CLEAR_MARGIN`]. A pack sitting right on the line otherwise re-arms every few
-/// seconds, and each arm speaks immediately, so the operator hears a flood instead of the
-/// [`BATTERY_WARN_REPEAT`] heartbeat. An unread sample (zero volts) is evidence of neither
-/// state: the latch holds and the run starts over. A zero threshold disables the whole thing
-/// and clears the latch.
-fn track_battery_warning(state: &RobotState, volts: f64, warn_v: f64) -> bool {
+/// Clearing is not the mirror image of arming: it takes two samples at or above the
+/// threshold plus [`BATTERY_WARN_CLEAR_MARGIN`]. A pack sitting right on the line otherwise
+/// re-arms every few seconds, and each arm speaks immediately, so the operator hears a flood
+/// instead of the [`BATTERY_WARN_REPEAT`] heartbeat. An unread sample (zero volts) is
+/// evidence of neither state: the latches hold and the runs start over. A zero threshold
+/// disables that tier and clears it.
+fn track_battery_warning(
+    state: &RobotState,
+    volts: f64,
+    warn_v: f64,
+    critical_v: f64,
+) -> Option<BatteryLevel> {
+    let previous = BatteryLevel::from_code(state.battery_level.load(Ordering::Relaxed));
     if !(warn_v > 0.0) {
-        state.battery_low.store(false, Ordering::Relaxed);
+        state
+            .battery_level
+            .store(BatteryLevel::Normal.code(), Ordering::Relaxed);
         state.battery_low_run.store(0, Ordering::Relaxed);
-        return false;
+        state.battery_critical_run.store(0, Ordering::Relaxed);
+        return None;
     }
     // `!(volts > 0.0)` and not `volts <= 0.0`: this also swallows a NaN, which must not be
     // read as "flat" any more than as "full".
     if !(volts > 0.0) {
         state.battery_low_run.store(0, Ordering::Relaxed);
-        return false;
+        state.battery_critical_run.store(0, Ordering::Relaxed);
+        return None;
     }
-    let armed = state.battery_low.load(Ordering::Relaxed);
-    let crossing = if armed {
-        volts >= warn_v + BATTERY_WARN_CLEAR_MARGIN
+    let low = battery_latch(
+        &state.battery_low_run,
+        previous >= BatteryLevel::Low,
+        volts,
+        warn_v,
+    );
+    let critical = if critical_v > 0.0 {
+        battery_latch(
+            &state.battery_critical_run,
+            previous == BatteryLevel::Critical,
+            volts,
+            critical_v,
+        )
     } else {
-        volts <= warn_v
-    };
-    let run = if crossing {
-        state.battery_low_run.fetch_add(1, Ordering::Relaxed) + 1
-    } else {
-        state.battery_low_run.store(0, Ordering::Relaxed);
-        0
-    };
-    if run < BATTERY_WARN_SAMPLES {
-        return false;
-    }
-    state.battery_low_run.store(0, Ordering::Relaxed);
-    if armed {
-        state.battery_low.store(false, Ordering::Relaxed);
+        state.battery_critical_run.store(0, Ordering::Relaxed);
         false
+    };
+    let level = if critical {
+        BatteryLevel::Critical
+    } else if low {
+        BatteryLevel::Low
     } else {
-        state.battery_low.store(true, Ordering::Relaxed);
-        true
+        BatteryLevel::Normal
+    };
+    state
+        .battery_level
+        .store(level.code(), Ordering::Relaxed);
+    (level > previous).then_some(level)
+}
+
+/// One tier's debounce and hysteresis. Returns the tier's state after this sample: it arms
+/// after [`BATTERY_WARN_SAMPLES`] samples at or below `threshold`, and drops only after that
+/// many at or above `threshold + BATTERY_WARN_CLEAR_MARGIN`.
+fn battery_latch(run: &AtomicU32, armed: bool, volts: f64, threshold: f64) -> bool {
+    let crossing = if armed {
+        volts >= threshold + BATTERY_WARN_CLEAR_MARGIN
+    } else {
+        volts <= threshold
+    };
+    if !crossing {
+        run.store(0, Ordering::Relaxed);
+        return armed;
     }
+    let samples = run.fetch_add(1, Ordering::Relaxed) + 1;
+    if samples < BATTERY_WARN_SAMPLES {
+        return armed;
+    }
+    run.store(0, Ordering::Relaxed);
+    !armed
 }
 
 async fn serve(
@@ -4944,6 +5159,11 @@ mod tests {
         (dir, state)
     }
 
+    /// The latched tier, for the battery-warning tests.
+    fn level(state: &RobotState) -> BatteryLevel {
+        BatteryLevel::from_code(state.battery_level.load(Ordering::Relaxed))
+    }
+
     /// **A low pack is heard about while it is sagging, not ten seconds later.** The warning
     /// runs off the raw sample with a two-sample debounce, speaks once when it arms, and goes
     /// quiet only once the pack has climbed clear of the threshold.
@@ -4952,36 +5172,42 @@ mod tests {
         let (_dir, state) = state_over("");
 
         // One sagging read is a dropped transaction, not a flat battery.
-        assert!(!track_battery_warning(&state, 7.0, 7.2));
-        assert!(!state.battery_low.load(Ordering::Relaxed));
+        assert_eq!(track_battery_warning(&state, 7.0, 7.2, 0.0), None);
+        assert_eq!(level(&state), BatteryLevel::Normal);
 
         // The second in a row is the news, and it is news once.
-        assert!(track_battery_warning(&state, 7.0, 7.2));
-        assert!(state.battery_low.load(Ordering::Relaxed));
-        assert!(!track_battery_warning(&state, 7.0, 7.2));
-        assert!(state.battery_low.load(Ordering::Relaxed));
+        assert_eq!(
+            track_battery_warning(&state, 7.0, 7.2, 0.0),
+            Some(BatteryLevel::Low)
+        );
+        assert_eq!(level(&state), BatteryLevel::Low);
+        assert_eq!(track_battery_warning(&state, 7.0, 7.2, 0.0), None);
+        assert_eq!(level(&state), BatteryLevel::Low);
 
         // Climbing back over the threshold is not recovery: the pack has to clear it by the
         // margin, and stay clear for two samples, before the latch drops.
-        assert!(!track_battery_warning(&state, 7.25, 7.2));
-        assert!(state.battery_low.load(Ordering::Relaxed));
-        assert!(!track_battery_warning(&state, 7.35, 7.2));
-        assert!(state.battery_low.load(Ordering::Relaxed));
-        assert!(!track_battery_warning(&state, 7.35, 7.2));
-        assert!(!state.battery_low.load(Ordering::Relaxed));
+        assert_eq!(track_battery_warning(&state, 7.25, 7.2, 0.0), None);
+        assert_eq!(level(&state), BatteryLevel::Low);
+        assert_eq!(track_battery_warning(&state, 7.35, 7.2, 0.0), None);
+        assert_eq!(level(&state), BatteryLevel::Low);
+        assert_eq!(track_battery_warning(&state, 7.35, 7.2, 0.0), None);
+        assert_eq!(level(&state), BatteryLevel::Normal);
 
         // And it can arm again afterwards.
-        assert!(!track_battery_warning(&state, 7.0, 7.2));
-        assert!(track_battery_warning(&state, 7.0, 7.2));
+        assert_eq!(track_battery_warning(&state, 7.0, 7.2, 0.0), None);
+        assert_eq!(
+            track_battery_warning(&state, 7.0, 7.2, 0.0),
+            Some(BatteryLevel::Low)
+        );
 
         // Zero volts means *not read yet*, never "flat" — and it is not evidence of recovery
         // either, so a warning that is already up stays up through a missing reading.
-        assert!(!track_battery_warning(&state, 0.0, 7.2));
-        assert!(state.battery_low.load(Ordering::Relaxed));
+        assert_eq!(track_battery_warning(&state, 0.0, 7.2, 0.0), None);
+        assert_eq!(level(&state), BatteryLevel::Low);
 
         // Zero threshold disables it and drops any latch that was up.
-        assert!(!track_battery_warning(&state, 7.0, 0.0));
-        assert!(!state.battery_low.load(Ordering::Relaxed));
+        assert_eq!(track_battery_warning(&state, 7.0, 0.0, 0.0), None);
+        assert_eq!(level(&state), BatteryLevel::Normal);
     }
 
     /// **A pack sitting on the threshold does not make the duck chatty.** Voltages wobbling
@@ -4991,22 +5217,71 @@ mod tests {
     #[test]
     fn a_battery_sitting_on_the_threshold_speaks_once() {
         let (_dir, state) = state_over("");
-        assert!(!track_battery_warning(&state, 7.49, 7.5));
-        assert!(track_battery_warning(&state, 7.49, 7.5));
+        assert_eq!(track_battery_warning(&state, 7.49, 7.5, 0.0), None);
+        assert_eq!(
+            track_battery_warning(&state, 7.49, 7.5, 0.0),
+            Some(BatteryLevel::Low)
+        );
 
         for volts in [7.51, 7.47, 7.52, 7.46, 7.50, 7.44, 7.53, 7.48, 7.49, 7.51, 7.46, 7.50] {
-            assert!(!track_battery_warning(&state, volts, 7.5), "{volts} re-armed");
-            assert!(
-                state.battery_low.load(Ordering::Relaxed),
-                "{volts} dropped the latch"
+            assert_eq!(
+                track_battery_warning(&state, volts, 7.5, 0.0),
+                None,
+                "{volts} re-armed"
             );
+            assert_eq!(level(&state), BatteryLevel::Low, "{volts} dropped the latch");
         }
 
         // Clear by the margin for two samples and it finally goes quiet.
-        assert!(!track_battery_warning(&state, 7.62, 7.5));
-        assert!(state.battery_low.load(Ordering::Relaxed));
-        assert!(!track_battery_warning(&state, 7.62, 7.5));
-        assert!(!state.battery_low.load(Ordering::Relaxed));
+        assert_eq!(track_battery_warning(&state, 7.62, 7.5, 0.0), None);
+        assert_eq!(level(&state), BatteryLevel::Low);
+        assert_eq!(track_battery_warning(&state, 7.62, 7.5, 0.0), None);
+        assert_eq!(level(&state), BatteryLevel::Normal);
+    }
+
+    /// **The two tiers are Li-ion voltage marks, and the louder one is heard at once.**
+    /// 7.4 V is 3.70 V per cell — nominal, the first warning; 7.0 V is 3.50 V per cell — the
+    /// knee, where a Li-ion pack should already be on the charger. A pack that keeps falling
+    /// steps up without waiting out the repeat, and recovering steps down, never up.
+    #[test]
+    fn the_critical_tier_escalates_and_recovers_one_step_at_a_time() {
+        let (_dir, state) = state_over("");
+
+        // Straight from normal to critical: both latches arm on the same second sample.
+        assert_eq!(track_battery_warning(&state, 6.9, 7.4, 7.0), None);
+        assert_eq!(
+            track_battery_warning(&state, 6.9, 7.4, 7.0),
+            Some(BatteryLevel::Critical)
+        );
+        assert_eq!(level(&state), BatteryLevel::Critical);
+
+        // Holding at critical is not news after the first sample.
+        assert_eq!(track_battery_warning(&state, 6.8, 7.4, 7.0), None);
+
+        // Back above the critical clear mark (7.1 V) but below the low one (7.5 V): the pack
+        // has recovered one tier, quietly, and the softer sentence gets said next repeat.
+        assert_eq!(track_battery_warning(&state, 7.15, 7.4, 7.0), None);
+        assert_eq!(track_battery_warning(&state, 7.15, 7.4, 7.0), None);
+        assert_eq!(level(&state), BatteryLevel::Low);
+
+        // Falling back under 7.0 V steps up again, and that is news.
+        assert_eq!(track_battery_warning(&state, 6.95, 7.4, 7.0), None);
+        assert_eq!(
+            track_battery_warning(&state, 6.95, 7.4, 7.0),
+            Some(BatteryLevel::Critical)
+        );
+
+        // Cleared for good only above the low tier's mark, two samples running.
+        assert_eq!(track_battery_warning(&state, 7.55, 7.4, 7.0), None);
+        assert_eq!(track_battery_warning(&state, 7.55, 7.4, 7.0), None);
+        assert_eq!(level(&state), BatteryLevel::Normal);
+
+        // A disabled critical tier never says the urgent sentence: 6.5 V is still only Low.
+        assert_eq!(track_battery_warning(&state, 6.5, 7.4, 0.0), None);
+        assert_eq!(
+            track_battery_warning(&state, 6.5, 7.4, 0.0),
+            Some(BatteryLevel::Low)
+        );
     }
 
     /// **A new skill needs a duration and an existing one does not**, so a client may send one
@@ -8327,10 +8602,11 @@ mod tests {
         let mut resting = DEFAULT_POSITION;
         resting[0] = DEFAULT_POSITION[0] + 0.5;
         let since = Instant::now();
+        let ramp = home_ramp(&Params::default());
         let bringup = Bringup::Homing {
             from: resting,
             since,
-            ramp: HOME_RAMP,
+            ramp,
         };
 
         // At the start it commands where the robot already is: no step, no lurch.
@@ -8339,7 +8615,7 @@ mod tests {
 
         // Halfway is halfway, per joint.
         let mid = bringup
-            .homing_target(since + HOME_RAMP / 2)
+            .homing_target(since + ramp / 2)
             .expect("still ramping");
         assert!(
             (mid[0] - (resting[0] + DEFAULT_POSITION[0]) / 2.0).abs() < 1e-6,
@@ -8349,10 +8625,10 @@ mod tests {
 
         // And it ends — `None` is what promotes the state to `Ready`, so a ramp that never
         // finished would leave the policy permanently locked out.
-        assert!(bringup.homing_target(since + HOME_RAMP).is_none());
+        assert!(bringup.homing_target(since + ramp).is_none());
         assert!(
             bringup
-                .homing_target(since + HOME_RAMP + Duration::from_secs(1))
+                .homing_target(since + ramp + Duration::from_secs(1))
                 .is_none()
         );
 
@@ -8368,19 +8644,22 @@ mod tests {
     /// current-hungry motion, which is the one thing a tired pack cannot afford.
     #[test]
     fn the_downed_ramp_is_the_same_ramp_taken_slower() {
-        assert!(DOWNED_RAMP > HOME_RAMP);
+        let params = Params::default();
+        let home = home_ramp(&params);
+        let downed = downed_ramp(&params);
+        assert!(downed > home);
         let since = Instant::now();
         let bringup = Bringup::Homing {
             from: DEFAULT_POSITION,
             since,
-            ramp: DOWNED_RAMP,
+            ramp: downed,
         };
 
         assert!(
-            bringup.homing_target(since + HOME_RAMP).is_some(),
+            bringup.homing_target(since + home).is_some(),
             "still ramping where a standing bring-up would be done"
         );
-        assert!(bringup.homing_target(since + DOWNED_RAMP).is_none());
+        assert!(bringup.homing_target(since + downed).is_none());
     }
 
     /// An enable asks for a return to home, and a robot already home must not answer it
@@ -8394,7 +8673,19 @@ mod tests {
 
         assert_eq!(farthest_from(&DEFAULT_POSITION, &DEFAULT_POSITION), 0.0);
         let mut seated = DEFAULT_POSITION;
-        seated[5] = DEFAULT_POSITION[5] + 4.0 * HOME_RETURN_DEADBAND;
+        seated[5] = DEFAULT_POSITION[5] + 1.5 * HOME_RETURN_DEADBAND;
         assert!(farthest_from(&seated, &DEFAULT_POSITION) > HOME_RETURN_DEADBAND);
+    }
+
+    /// The standing pose off the real robot, knee compliance and all, must not trip the
+    /// return-home ramp: 0.037 rad was measured on the knees with the robot holding home,
+    /// and it is the reason this deadband is 8.6° rather than 2.9°.
+    #[test]
+    fn the_measured_standing_pose_does_not_ask_for_a_ramp() {
+        let mut standing = DEFAULT_POSITION;
+        standing[3] = 0.03835; // left_knee, measured holding home
+        standing[6] = DEFAULT_POSITION[6] + 0.0206; // head_pitch, measured
+        standing[13] = -0.03068; // right_knee, measured
+        assert!(farthest_from(&standing, &DEFAULT_POSITION) < HOME_RETURN_DEADBAND);
     }
 }

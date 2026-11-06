@@ -173,6 +173,10 @@ impl Live {
 /// walks fine and stays quiet.
 pub struct Sound {
     bank: PathBuf,
+    /// Fixed spoken prompts — see [`Sound::play_prompt`]. Kept apart from `bank` because
+    /// `sounds ensure-bank` replaces the bank directory, and because a prompt is one
+    /// sentence rather than a randomly picked variant.
+    prompts: PathBuf,
     device: String,
     child: Option<Child>,
     /// The wheee rider loops while this is true. Shared with the writer thread; clearing
@@ -197,9 +201,10 @@ pub struct Sound {
 }
 
 impl Sound {
-    pub fn new(bank: PathBuf, device: String) -> Self {
+    pub fn new(bank: PathBuf, prompts: PathBuf, device: String) -> Self {
         Self {
             bank,
+            prompts,
             device,
             child: None,
             wheee_held: Arc::new(AtomicBool::new(false)),
@@ -287,11 +292,9 @@ impl Sound {
         //
         // The blocking goodbye peck is the exception, and the only one: it is the last
         // sound this process makes, so it takes the PCM off whatever holds it.
-        if self.ride != Ride::Off && !blocking {
-            tracing::debug!(tag, "sound skipped: the wheee ride has the PCM");
+        if !self.take_pcm(tag, blocking) {
             return;
         }
-        self.stop_child();
         let Some(wav) = self.pick(tag) else {
             if !self.warned_missing {
                 self.warned_missing = true;
@@ -302,6 +305,42 @@ impl Sound {
             }
             return;
         };
+        self.play_wav(wav, tag, blocking);
+    }
+
+    /// Play a fixed spoken prompt: `<prompts>/<name>.wav`.
+    ///
+    /// Unlike a bank tag this is one known file, not a random variant — an operator-facing
+    /// sentence must say the same thing every time. `fallback` is the bank tag to play when
+    /// the file is absent, so a board without a prompt set keeps the duck's own voice for
+    /// that event rather than going silent.
+    pub fn play_prompt(&mut self, name: &str, fallback: Option<&str>, blocking: bool) {
+        let wav = self.prompts.join(format!("{name}.wav"));
+        if wav.is_file() {
+            if self.take_pcm(name, blocking) {
+                self.play_wav(wav, name, blocking);
+            }
+            return;
+        }
+        tracing::debug!(name, "no prompt wav; using the voice bank's call");
+        if let Some(tag) = fallback {
+            self.play(tag, blocking);
+        }
+    }
+
+    /// Take the PCM for a one-shot, unless a ride owns it. Returns whether the caller may
+    /// start a sound now.
+    fn take_pcm(&mut self, label: &str, blocking: bool) -> bool {
+        if self.ride != Ride::Off && !blocking {
+            tracing::debug!(tag = label, "sound skipped: the wheee ride has the PCM");
+            return false;
+        }
+        self.stop_child();
+        true
+    }
+
+    /// Start `aplay` on one wav file. `blocking` waits for it to finish, bounded.
+    fn play_wav(&mut self, wav: PathBuf, label: &str, blocking: bool) {
         let child = Command::new("aplay")
             .args(["-q", "-D", &self.device])
             .arg(&wav)
@@ -312,7 +351,7 @@ impl Sound {
         match child {
             Ok(mut c) if blocking => wait_bounded(&mut c, BLOCKING_PLAY_MAX),
             Ok(c) => self.child = Some(c),
-            Err(e) => tracing::debug!(error = %e, tag, "aplay failed"),
+            Err(e) => tracing::debug!(error = %e, tag = label, "aplay failed"),
         }
     }
 
@@ -891,8 +930,16 @@ mod tests {
     /// A missing bank must degrade to silence, not errors — robots without a codec walk on.
     #[test]
     fn a_missing_bank_is_silent_not_fatal() {
-        let mut sound = Sound::new(PathBuf::from("/nonexistent/bank"), "default".into());
+        let mut sound = Sound::new(
+            PathBuf::from("/nonexistent/bank"),
+            PathBuf::from("/nonexistent/prompts"),
+            "default".into(),
+        );
         sound.play("chirp", false);
+        // A prompt with no prompt directory falls back to the bank call; one with neither
+        // is silent. Both must stay non-fatal on a board with no codec or bank.
+        sound.play_prompt("boot", Some("greet"), false);
+        sound.play_prompt("fault_reset", None, false);
         sound.wheee(WheeeHold::Held);
         sound.wheee(WheeeHold::Released);
         assert!(sound.child.is_none());
@@ -907,7 +954,11 @@ mod tests {
     fn a_bank_without_wheee_triads_latches_instead_of_respawning() {
         let dir = std::env::temp_dir().join(format!("sound-triads-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("wheee")).unwrap();
-        let mut sound = Sound::new(dir.clone(), "null".into());
+        let mut sound = Sound::new(
+            dir.clone(),
+            PathBuf::from("/nonexistent/prompts"),
+            "null".into(),
+        );
 
         sound.wheee(WheeeHold::Held);
         assert_eq!(sound.ride, Ride::Riding, "the fallback must latch");
@@ -925,7 +976,11 @@ mod tests {
     fn a_decayed_hold_lands_and_a_release_cuts() {
         let dir = std::env::temp_dir().join(format!("sound-exits-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("wheee")).unwrap();
-        let mut sound = Sound::new(dir.clone(), "null".into());
+        let mut sound = Sound::new(
+            dir.clone(),
+            PathBuf::from("/nonexistent/prompts"),
+            "null".into(),
+        );
 
         // Decay: land, then reap. No child ever spawned here, so the reap is immediate —
         // on a real ride it takes as many ticks as the end segment lasts.
