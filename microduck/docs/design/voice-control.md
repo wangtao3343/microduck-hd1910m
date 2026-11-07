@@ -7,37 +7,59 @@ Speaking a Chinese command to the duck moves it. Everything on the instruction p
 local: the microphone, the recognizer, the vocabulary, the intent. Nothing is uploaded.
 
 ```
-arecord (48 kHz stereo, right channel) → 16 kHz mono → sherpa-onnx streaming zipformer
-   → transcript → vocabulary → robot.move / robot.do / robot.sound / robot.stop
+arecord (48 kHz stereo, right channel) → 16 kHz mono → Silero VAD (utterance boundaries)
+   → sherpa-onnx offline SenseVoice → transcript → vocabulary
+   → robot.move / robot.do / robot.sound / robot.stop
 ```
 
-## Why full streaming ASR and no wake word
+## What it listens with
 
-The planning doc left one architecture question open — a small keyword spotter in front of
-the recognizer, or the recognizer itself — to be decided by measuring this board. Measured
-on 2026-11-07 with `sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23` (int8, 29 MB):
+There is no wake word and no keyword spotter; the VAD is the front end and the recognizer
+runs on whatever it hands over. That was decided by measuring, twice.
 
-| | result | criterion |
-|---|---|---|
-| RTF, one thread, real-time pacing | 0.26 | < 0.5 |
-| CPU frequency, 2 minutes continuous | 1800 MHz throughout | ≥ 1.4 GHz |
-| SoC temperature | 67–73 °C (idle 63 °C) | ≤ 85 °C |
-| RSS | 117 MB, flat | no growth |
+The first measurement (2026-11-07) chose a *streaming* zipformer — 14M parameters, 29 MB,
+RTF 0.26 at one thread, 1800 MHz and 67–73 °C under continuous decoding — because at a
+quarter of a core, always-on recognition is affordable. It also could not hear 叫一声: the
+model returned 叫医生 and 下一声, the right pinyin and the wrong characters, so the vocabulary
+never matched. Hotword biasing (modified beam search, `cjkchar`, score 3.0) fixed some of it
+and raised the idle cost to a third of a core — a real tax for a patch.
 
-Two threads bought 15% of wall clock for 2.5× the CPU time — the model is small enough that
-ONNX Runtime's intra-op parallelism is mostly spin — so the daemon runs one thread and
-leaves three of the SoC's four cores to `robotd`.
+The second measurement (same evening) compared every Chinese model this board can run, on
+the board's own prompt bank (`/var/lib/robot/prompts`, 11 sentences), through the same
+24-tap anti-alias decimator and the same CER:
 
-The consequence is that continuous listening is affordable, so there is no keyword spotter
-and no wake word: the recognizer runs all the time and decides for itself when an utterance
-ended (2.4 s of silence with nothing decoded, 1.2 s after the last word). If the enclosure
-ever runs hot in summer, the fallback the planning doc describes — a keyword model in front,
-recognizer on demand — is still available and does not change anything above the vocabulary.
+| model | CER | decode RTF (2 threads) | RSS | load |
+|---|---|---|---|---|
+| streaming zipformer 14M-2023 | 12.5 % | 0.21, always on | 108 MB | 15 s |
+| streaming zipformer zh-int8-2025-06-30 | 10.9 % | 0.70, always on | ~200 MB | — |
+| **SenseVoice-small int8-2024-07-17** | **7.8 %** | 0.42 per utterance | 366 MB | 11.5 s |
+| paraformer-zh int8-2023-09-14 | 7.8 % | 0.46 per utterance | ~400 MB | 10.5 s |
 
-The daemon itself, measured on the board on 2026-11-07 (`--dry-run`, 70 s, one thread):
-RSS 101 MB flat, 65 °C, 1800 MHz throughout, about a quarter of a core. It loads the four
-model files in **15 s** — the recognizer is ready 15 s after start, which is why the unit is
-`Type=exec` and nothing waits on it.
+The two offline models tie; SenseVoice is faster per utterance and emits punctuation, so
+that is what ships. (The RSS column is the Python bench's figure; the daemon keeps about
+600 MB resident, measured below.) The five remaining prompt errors are 伺服 → 四伏/四幅 twice and 噶 → 嘎 —
+none of them vocabulary words. The NPU is not a route: `/usr/lib/librknnrt.so` and
+`CONFIG_ROCKCHIP_RKNPU=y` are present but there is no `/dev/rknpu`, and the sherpa-onnx
+libraries this crate ships are the CPU build.
+
+Offline models need an utterance, so `vad.rs` supplies one: Silero VAD (1.8 MB) classifies
+32 ms frames as speech or not, and releases a segment after `min_silence_duration` (0.5 s) of
+silence — `max_speech_duration` (10 s) forces a cut so a television cannot hold a segment
+open. The detector runs all the time at about a tenth of a core; the recognizer runs only on
+segments. Measured on the same prompts: a 1.2 s command decodes in 0.5 s, so the duck moves
+about a second after the speaker stops (0.5 s of endpoint silence plus the decode).
+
+The daemon measured on the board (2026-11-07 evening, `--dry-run`, prompts played through
+the codec): idle **~9.5 % of a core** (VAD only, against 33 % for the streaming build),
+RSS **607 MB** flat across decodes, decode RTF **0.39** with two threads (3.8 s utterance →
+1.5 s), and **~25 s** to load the model from a cold start.
+
+The trade for that accuracy is what streaming used to give: no partial transcript while the
+person is still talking, and no hotwords (SenseVoice decodes greedily and the C API's hotword
+path needs a transducer beam search). The intent layer did not change at all.
+
+The daemon is not ready for **~25 s** after start (model load, measured on the board); that
+is why the unit is `Type=exec` and nothing waits on it.
 
 ## The vocabulary
 
@@ -74,7 +96,8 @@ mechanisms, both tested:
 - No prompt in the voice bank parses as a command — `intent.rs` has a test over the whole
   prompt list, including 我累了，休息一下.
 - A sound this daemon asks for is followed by a 900 ms deaf window, so the quack's echo is
-  never fed to the recognizer.
+  never fed to the segmenter — and the segmenter is reset when the window opens, so a
+  half-captured command cannot be completed by the quack.
 
 How loud that echo is, measured: playing `relax.wav` (「我累了，休息一下」) through the codec
 at the bank's own level saturates the capture — right channel peak 1.000, RMS 0.38 — and the
@@ -93,7 +116,8 @@ Board artifacts, none of which ship in the release:
 
 | what | where | why not in the release |
 |---|---|---|
-| model (`encoder/decoder/joiner/tokens`) | `/var/lib/robot/asr/zh-14m` | 29 MB, changes yearly |
+| model (`model.int8.onnx`, `tokens.txt`) | `/var/lib/robot/asr/sensevoice` | 240 MB, changes yearly |
+| VAD (`silero_vad.onnx`) | `/var/lib/robot/asr/silero_vad.onnx` | 1.8 MB, from the same sherpa-onnx release |
 | `libsherpa-onnx-c-api.so`, `libonnxruntime.so` | next to `duck-ear` | see below |
 
 The two libraries are the sherpa-onnx release's `linux-aarch64-shared-cpu` build. They
@@ -116,7 +140,8 @@ being a separate installation step.
 
 ```bash
 duck-ear --dry-run
-# journal: "heard so far" partials, then `heard = "坐下"` / "not a command"`
+# journal: `heard = "坐下"` / `heard = "我累了，休息一下"` / `heard = "…" not a command`
+# one line per utterance; `RUST_LOG=duck_ear=debug` adds the segment length and decode time
 ```
 
 To make it hear a known sentence, play it through the codec, not the card's default device

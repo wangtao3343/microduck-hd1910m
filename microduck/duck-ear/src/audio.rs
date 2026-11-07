@@ -14,9 +14,10 @@ use voice::RATE;
 
 /// How many mono samples one [`Microphone::read_block`] returns at 48 kHz.
 ///
-/// 30 ms. Small enough that the recognizer sees speech while it is still being spoken
-/// (its own endpointing works on chunks of 10–100 ms), large enough that a 50 Hz-ish loop
-/// and one `read_exact` per block are not the bottleneck.
+/// 30 ms. The VAD works on 32 ms windows and buffers anything shorter, so this is the
+/// granularity it can keep up with without being handed a chunk whose internal alignment
+/// it has to re-derive; and one `read_exact` per 30 ms keeps the motion-refresh loop and
+/// the syscall rate trivial.
 pub const BLOCK_SAMPLES: usize = (RATE as usize * 30) / 1000;
 
 /// The sample rate the model was trained at; `sherpa-onnx` will not resample for us.
@@ -50,7 +51,11 @@ impl Microphone {
                 "-q",
             ])
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // Inherited, not piped: this daemon stops reading while it decodes an utterance,
+            // which makes ALSA report overruns, and a pipe nobody drains would eventually
+            // block `arecord` on its own diagnostics. The journal is the right place for
+            // them, and one overrun line per command is useful evidence of the stall.
+            .stderr(Stdio::inherit())
             .spawn()
             .with_context(|| format!("cannot run arecord on {device}"))?;
         let stdout = child.stdout.take().context("arecord has no stdout")?;

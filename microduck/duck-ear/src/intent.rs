@@ -4,12 +4,18 @@
 //! about; this module decides whether it is a command. It holds no state and opens no
 //! sockets, so the whole vocabulary is testable against strings.
 //!
-//! **Matching is containment after normalisation, not equality.** The streaming model emits
-//! a plausible sentence around the words it heard — "嗯坐下吧" and "坐下" both arrive — so
+//! **Matching is containment after normalisation, not equality.** The recognizer emits a
+//! plausible sentence around the words it heard — "嗯坐下吧" and "坐下" both arrive — so
 //! equality would miss most real utterances while containment would accept "别坐下" as sit.
 //! The compromise is a vocabulary of phrases that are unambiguous inside a sentence, checked
 //! in priority order, with [`Command::Stop`] first because a false stop is cheap and a
 //! missed stop is not.
+//!
+//! **This layer did not change when the recognizer did.** With the first streaming model,
+//! 叫一声 arrived as 叫医生 — the right pinyin, the wrong characters, and so no match — a
+//! model problem that hotword biasing only partly papered over. The recognizer is now
+//! SenseVoice, run on one VAD-segmented utterance at a time, and the vocabulary is still
+//! just phrases: everything here is testable without a microphone and that is the point.
 //!
 //! **Deliberately absent: "开始"/"解锁".** Starting the policy is the gamepad's job. A
 //! microphone that can energise the joints is a microphone that can energise them because a
@@ -76,28 +82,6 @@ pub fn parse(text: &str) -> Option<Command> {
         .iter()
         .find(|(_, phrases)| phrases.iter().any(|p| normalized.contains(p)))
         .map(|(command, _)| *command)
-}
-
-/// The vocabulary as sherpa-onnx hotwords: one phrase per line, fed to the beam search.
-///
-/// Measured on the board, not guessed at: with plain greedy search the 14M model
-/// transcribed 叫一声 as 叫医生 — the same pinyin, the wrong characters, and so no match —
-/// and 叫一声 as 下一声. A hotword is a per-token score bonus for the tokens of the phrase
-/// while they are being decoded, which is exactly the lever for "the acoustics are close,
-/// the characters are not".
-///
-/// **Single-character phrases are left out.** 停 is in the vocabulary, but a one-character
-/// hotword is one token of bonus and every 听/挺/厅 in the room pays for it. The others are
-/// covered by 停下 in any case.
-pub fn hotwords() -> String {
-    let mut text = String::new();
-    for (_, phrases) in VOCABULARY {
-        for phrase in phrases.iter().filter(|p| p.chars().count() > 1) {
-            text.push_str(phrase);
-            text.push('\n');
-        }
-    }
-    text
 }
 
 /// Drop everything that is not a meaningful character: whitespace, ASCII punctuation, and the
@@ -199,24 +183,4 @@ mod tests {
         assert_eq!(parse("......"), None);
     }
 
-    #[test]
-    fn every_multi_character_phrase_is_a_hotword() {
-        // The decoder and the matcher must agree on what the phrases are; if they drift,
-        // the hotword biases toward something `parse` would not accept.
-        let hotwords = hotwords();
-        for (_, phrases) in VOCABULARY {
-            for phrase in *phrases {
-                let listed = hotwords.lines().any(|line| line == *phrase);
-                assert_eq!(
-                    listed,
-                    phrase.chars().count() > 1,
-                    "phrase {phrase:?} listed = {listed}"
-                );
-            }
-        }
-        // And the hotword file's lines really are the vocabulary, not a superset.
-        for line in hotwords.lines() {
-            assert!(parse(line).is_some(), "hotword {line:?} is not a command");
-        }
-    }
 }

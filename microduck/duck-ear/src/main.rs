@@ -1,7 +1,8 @@
 //! `duck-ear` — voice control for the duck.
 //!
-//! Microphone → streaming Chinese ASR → a small command vocabulary → the same JSON-RPC
-//! intents the gamepad sends. Everything is on the board: the audio never leaves it.
+//! Microphone → Silero VAD → one utterance at a time into offline SenseVoice → a small
+//! command vocabulary → the same JSON-RPC intents the gamepad sends. Everything is on the
+//! board: the audio never leaves it.
 //!
 //! ## What this is not
 //!
@@ -19,6 +20,14 @@
 //! play on its own — a battery warning, a fault — is not covered by that window; that is a
 //! known gap, not an oversight, and the vocabulary is the thing doing the real work.
 //!
+//! ## Why segmentation
+//!
+//! The recognizer is offline, so the daemon pays for ASR only when somebody speaks: the VAD
+//! runs continuously at a few percent of a core and a command costs about half a second of
+//! two cores. The price is latency — the detector waits 0.5 s of silence before it releases
+//! an utterance, and the decode adds 0.4–0.8 s — so a command lands about a second after
+//! the speaker stops.
+//!
 //! ```text
 //! duck-ear --dry-run            # print transcripts, send nothing
 //! duck-ear                      # listen and act
@@ -28,6 +37,7 @@ mod asr;
 mod audio;
 mod client;
 mod intent;
+mod vad;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -42,21 +52,19 @@ use crate::asr::Recognizer;
 use crate::audio::{Downsample3, Microphone};
 use crate::client::Robot;
 use crate::intent::Command;
+use crate::vad::Segmenter;
 
 /// How long to stay deaf after asking robotd to play a sound.
 ///
 /// The quack is under a second; this covers it and the microphone's own buffering with
-/// margin. Silence is not fed to the recognizer during the window rather than fed as
+/// margin. Silence is not fed to the segmenter during the window rather than fed as
 /// zeroes — either ends the current utterance, and dropping the audio keeps the block the
 /// quack arrives in out of the next utterance's features.
 const DEAF_AFTER_SOUND: Duration = Duration::from_millis(900);
 
 /// How often a `forward` command is refreshed. The deadman is 500 ms; 100 ms leaves room
-/// for a decode chunk to run long without the robot stuttering to a halt mid-step.
+/// for a decode to run long without the robot stuttering to a halt mid-step.
 const MOVE_REFRESH: Duration = Duration::from_millis(100);
-
-/// How often the partial transcript is written to the journal, and only when it changed.
-const PARTIAL_LOG: Duration = Duration::from_millis(750);
 
 #[derive(Parser)]
 #[command(about = "Hear Chinese commands and send the matching robot intents")]
@@ -65,17 +73,21 @@ struct Args {
     #[arg(long, default_value = "/run/robotd.sock")]
     socket: PathBuf,
 
-    /// Directory holding the streaming zipformer model (encoder/decoder/joiner/tokens).
-    #[arg(long, default_value = "/var/lib/robot/asr/zh-14m")]
+    /// Directory holding the SenseVoice model (model.int8.onnx and tokens.txt).
+    #[arg(long, default_value = "/var/lib/robot/asr/sensevoice")]
     model: PathBuf,
+
+    /// Silero VAD model. Ships next to the recognizer.
+    #[arg(long, default_value = "/var/lib/robot/asr/silero_vad.onnx")]
+    vad: PathBuf,
 
     /// ALSA capture device. `plughw` does the format conversion; the codec is stereo with
     /// signal on the right channel only, which `audio` keeps.
     #[arg(long, default_value = voice::CAPTURE_DEVICE)]
     device: String,
 
-    /// ONNX Runtime intra-op threads. One, for the reason `asr::Recognizer::new` measures.
-    #[arg(long, default_value_t = 1)]
+    /// ONNX Runtime intra-op threads. Two is `asr::Recognizer::new`'s measurement.
+    #[arg(long, default_value_t = 2)]
     threads: i32,
 
     /// Transcribe and classify, but never open the robotd socket.
@@ -85,7 +97,7 @@ struct Args {
 
 /// Exit status for "this board is not configured for the ear": no model, no microphone.
 ///
-/// `duck-ear.service` has `RestartPreventExitStatus=78`, so a missing 29 MB artifact does
+/// `duck-ear.service` has `RestartPreventExitStatus=78`, so a missing 240 MB artifact does
 /// not become a restart every five seconds in the journal. A microphone that disappears
 /// *later* is a different failure and returns 1, which does restart.
 const EXIT_CONFIG: u8 = 78;
@@ -117,30 +129,36 @@ fn main() -> ExitCode {
 
 struct Ear {
     mic: Microphone,
+    segmenter: Segmenter,
     recognizer: Recognizer,
     down: Downsample3,
     pcm: Vec<f32>,
+    /// Utterances returned by the segmenter this block, reused across blocks.
+    segments: Vec<Vec<f32>>,
     robot: Option<Robot>,
     /// Set while a bounded forward command is running.
     forward: Option<Instant>,
     /// When the last movement refresh went out, so the loop sends at [`MOVE_REFRESH`] rather
     /// than once per 30 ms audio block.
     last_move: Instant,
-    /// No audio is fed to the recognizer before this instant — see [`DEAF_AFTER_SOUND`].
+    /// No audio is fed to the segmenter before this instant — see [`DEAF_AFTER_SOUND`].
     deaf_until: Instant,
-    last_partial: Instant,
-    last_partial_text: String,
 }
 
 impl Ear {
     fn new(args: &Args) -> Result<Self> {
         tracing::info!(
             model = %args.model.display(),
+            vad = %args.vad.display(),
             device = %args.device,
-            "loading the streaming ASR model"
+            "loading the ASR model and the VAD"
         );
-        let mic = Microphone::open(&args.device)?;
+        // Models before microphone: a missing 240 MB artifact is a configuration error worth
+        // the exit status 78 that stops systemd restarting, and it should be reported as
+        // such even while something else has the capture device open.
+        let segmenter = Segmenter::new(&args.vad)?;
         let recognizer = Recognizer::new(&args.model, args.threads)?;
+        let mic = Microphone::open(&args.device)?;
         let robot = (!args.dry_run).then(|| {
             // Not connected here: the first command connects, and a robotd that is down at
             // startup must not keep the listener from starting — it would come up deaf
@@ -150,15 +168,15 @@ impl Ear {
         });
         Ok(Self {
             mic,
+            segmenter,
             recognizer,
             down: Downsample3::new(),
             pcm: Vec::with_capacity(audio::BLOCK_SAMPLES / 3 + 1),
+            segments: Vec::new(),
             robot,
             forward: None,
             last_move: Instant::now(),
             deaf_until: Instant::now(),
-            last_partial: Instant::now(),
-            last_partial_text: String::new(),
         })
     }
 
@@ -172,17 +190,9 @@ impl Ear {
             if Instant::now() >= self.deaf_until {
                 self.pcm.clear();
                 self.down.push(&block, &mut self.pcm);
-                self.recognizer.accept(&self.pcm);
-                self.recognizer.run();
-                self.log_partial();
-
-                if self.recognizer.is_endpoint() {
-                    let text = self.recognizer.text();
-                    self.recognizer.reset();
-                    self.last_partial_text.clear();
-                    if !text.trim().is_empty() {
-                        self.handle(&text, dry_run);
-                    }
+                self.segmenter.push(&self.pcm, &mut self.segments);
+                for segment in std::mem::take(&mut self.segments) {
+                    self.utterance(&segment, dry_run);
                 }
             }
 
@@ -190,17 +200,21 @@ impl Ear {
         }
     }
 
-    /// Log the growing hypothesis, but only when it changed and not on every block.
-    fn log_partial(&mut self) {
-        if self.last_partial.elapsed() < PARTIAL_LOG {
+    /// One finished utterance: transcribe it, then act on what it said.
+    fn utterance(&mut self, samples: &[f32], dry_run: bool) {
+        let seconds = samples.len() as f32 / audio::MODEL_RATE as f32;
+        let started = Instant::now();
+        let text = self.recognizer.transcribe(samples);
+        let decode = started.elapsed();
+        tracing::debug!(
+            seconds = format!("{seconds:.1}"),
+            decode_ms = decode.as_millis(),
+            "segment decoded"
+        );
+        if text.trim().is_empty() {
             return;
         }
-        self.last_partial = Instant::now();
-        let text = self.recognizer.text();
-        if text != self.last_partial_text && !text.is_empty() {
-            tracing::debug!(partial = %text, "heard so far");
-            self.last_partial_text = text;
-        }
+        self.handle(&text, dry_run);
     }
 
     fn handle(&mut self, text: &str, dry_run: bool) {
@@ -278,6 +292,9 @@ impl Ear {
     /// The acknowledgement quack, and the deaf window that goes with it.
     fn chirp(&mut self) {
         self.deaf_until = Instant::now() + DEAF_AFTER_SOUND;
+        // Whatever the detector has buffered is the tail of the command, or the start of the
+        // quack — either way not an utterance to decode.
+        self.segmenter.reset();
         if let Some(robot) = self.robot.as_mut() {
             robot.notify(&Call::RobotSound(proto::SoundParams {
                 tag: SoundTag::Chirp,
