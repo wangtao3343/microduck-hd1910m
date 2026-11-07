@@ -1,0 +1,62 @@
+# duck-ear — voice commands.
+#
+# Install to /etc/systemd/system/duck-ear.service, with sysusers.d/duck-ear.conf for its
+# user. `hooks/postinstall` installs both and runs `systemd-sysusers` before the units.
+#
+# Listens continuously. That is a measured decision, not a default: a full streaming
+# recognizer costs about a quarter of one core on this SoC and holds ~68 °C, which is why
+# there is no wake word and no keyword spotter in front of it — see
+# `docs/design/voice-control.md` for the numbers and the fallback if the enclosure runs hot.
+
+[Unit]
+Description=Voice command listener
+Documentation=file:///opt/robot/daemon/current/docs/voice-control.md
+
+# Same shape as mediad's: wherever the commands go is worth starting after, but a robotd
+# that is down must not keep the ear from starting. The first command reconnects, and a
+# listener that refused to start would stay deaf for the life of the uptime.
+After=robotd.service local-fs.target
+Wants=robotd.service
+
+[Service]
+Type=exec
+ExecStart=/opt/robot/daemon/current/bin/duck-ear
+
+# The ASR model is a board artifact, not release cargo: ~29 MB of ONNX that changes far
+# less often than this binary. `--model` defaults to the path below.
+#
+# The sherpa-onnx shared libraries sit beside the binary and are found by an `$ORIGIN`
+# rpath, so nothing here has to set LD_LIBRARY_PATH. They carry their own ONNX Runtime and
+# must never be installed into the directory robotd loads 1.28 from.
+User=duck-ear
+Group=duck-ear
+# audio — /dev/snd, the codec. robot — robotd's 0660 socket; being in this group is how a
+# non-root listener is allowed to send intents at all.
+SupplementaryGroups=audio robot
+
+Restart=always
+RestartSec=5s
+# 78 is "this board is not configured": the model directory is absent (it is a board
+# artifact, not release cargo — see docs/design/voice-control.md). Exiting 78 must not
+# become a restart every five seconds forever; a microphone that dies later is a different
+# code and does restart.
+RestartPreventExitStatus=78
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# Deliberately NOT PrivateDevices: /dev/snd is the whole point.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+
+Environment=RUST_LOG=info
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

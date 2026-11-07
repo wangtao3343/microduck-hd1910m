@@ -1,0 +1,38 @@
+[package]
+name = "duck-ear"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Voice control — hears a Chinese command, sends the matching robot intent"
+build = "build.rs"
+
+[[bin]]
+name = "duck-ear"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { workspace = true, features = ["derive"] }
+duck-ipc-proto = { path = "../duck-ipc-proto" }
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+# The capture device and the codec's right-channel rule live in one place, and this is the
+# crate that already reads the microphone.
+voice = { path = "../voice" }
+
+# sherpa-onnx: the streaming Chinese zipformer, through the C API.
+#
+# `default-features = false` drops `tts`, which is half the crate and none of this. The
+# `download-binaries` feature fetches the prebuilt aarch64 shared libraries at build time
+# (see `scripts/` and the deployment note in the crate docs) instead of building ONNX
+# Runtime from source — a 227 MB static archive against a 21 MB one. `sys` re-exports the
+# raw bindings: sherpa-rs 0.6 wraps the offline recognizer and the keyword spotter but not
+# the *online* recognizer, so `asr.rs` calls the C API directly.
+#
+# **This is a C dependency and it brings its own ONNX Runtime.** `robotd` dlopens the
+# board's 1.28; sherpa carries a second, private copy that must not be installed into the
+# same directory or both daemons break in different ways. `build.rs` puts an `$ORIGIN`
+# rpath in the binary and the release lays the two `.so` files next to it.
+sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries", "sys"] }

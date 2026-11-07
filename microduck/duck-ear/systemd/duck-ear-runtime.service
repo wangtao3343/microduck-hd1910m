@@ -1,0 +1,42 @@
+# duck-ear —— 板上 runtime 部署用的单元（不是 /opt/robot 那套）。
+#
+# 装到 /etc/systemd/system/duck-ear.service。
+# 与同目录的 duck-ear.service 的区别只在部署形态：那套用 User=duck-ear / Group=robot、
+# 二进制在 /opt/robot/daemon/current/bin；我们这套跑在 duck 用户的 workspace 下，
+# robotd 的 socket 也在 local/，所以路径全部显式写死。
+#
+# 两个 .so 和二进制放在一起（$ORIGIN rpath），模型不在发布包里、板上单独放在
+# /var/lib/robot/asr/zh-14m —— 这是 --model 的默认值，不用写。
+#
+# 常驻听是量过的选择：约 1/4 个核、稳态 65 °C、RSS 101 MB 不涨。见
+# microduck/docs/design/voice-control.md。
+
+[Unit]
+Description=MicroDuck voice command listener (duck-ear)
+# 和 padd 一样：robotd 没起来不能把耳朵卡死 —— 它只在第一条指令时才连 socket。
+After=microduck-hd1910.service
+Wants=microduck-hd1910.service
+
+[Service]
+Type=exec
+User=duck
+# /dev/snd 的权限来自 audio 组（duck 现在就在里面，写出来是防止以后改）。
+SupplementaryGroups=audio
+
+WorkingDirectory=/home/duck/workspace/microduck-hd1910m
+# socket 必须显式指：默认找 /run/robotd.sock，我们这套 runtime 不用那个路径。
+ExecStart=/home/duck/workspace/microduck-hd1910m/out/arm64/bin/duck-ear \
+    --socket /home/duck/workspace/microduck-hd1910m/local/robotd.sock
+
+Restart=always
+RestartSec=5s
+# 78 是"这块板没配好"：模型目录不在（模型是板上产物，不在发布包里）。不重试，
+# 免得日志里五秒一条；麦克风中途掉了是别的退出码，照常重启。
+RestartPreventExitStatus=78
+
+Environment=RUST_LOG=info
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
