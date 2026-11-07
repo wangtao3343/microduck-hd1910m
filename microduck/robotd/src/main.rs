@@ -186,6 +186,16 @@ impl BatteryLevel {
     }
 }
 
+/// What one battery sample is worth saying out loud.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatteryNotice {
+    /// A tier armed on a sample taken at rest: say the sentence now.
+    Escalated(BatteryLevel),
+    /// Below the warn line while the servos were moving. The move is drawing the sag, so this
+    /// is not evidence about the pack — one call, and no words.
+    Sag,
+}
+
 /// How long the shutdown sit gets before torque is cut and the machine powers off, when no
 /// controller is there to say. The sitstand descent is a deliberate ~2 s glide; the prototype
 /// gives it four seconds, and a running controller derives the same from the set's `ramp_s`
@@ -296,6 +306,14 @@ fn speak(
     } else {
         *queue = Some((Instant::now() + QUACK_LEAD, name.to_owned(), fallback));
     }
+}
+
+/// Queue a sentence with no call in front of it.
+///
+/// For the end of an announcement that has already made the duck's own noises — the three
+/// chirps of a finished bring-up — where [`speak`] would add a fourth.
+fn say(queue: &mut SpeechQueue, name: &str, fallback: Option<&'static str>) {
+    *queue = Some((Instant::now(), name.to_owned(), fallback));
 }
 
 /// Where the limp-fall sequence is (`[safety] limp_fall`).
@@ -695,6 +713,9 @@ struct RobotState {
     /// one noisy read cannot start the duck shouting.
     battery_low_run: AtomicU32,
     battery_critical_run: AtomicU32,
+    /// Consecutive raw samples below the warn line *while the servos were moving*. These do
+    /// not arm a tier — that is the whole point — but two in a row earn one call.
+    battery_sag_run: AtomicU32,
     /// Hottest servo of the last thermal sample: temperature as `f64::to_bits`, and which
     /// joint it was. Zero means *not read yet*, same as the battery.
     motor_max_c: AtomicU64,
@@ -830,6 +851,7 @@ impl RobotState {
             battery_level: AtomicU8::new(BatteryLevel::Normal.code()),
             battery_low_run: AtomicU32::new(0),
             battery_critical_run: AtomicU32::new(0),
+            battery_sag_run: AtomicU32::new(0),
             motor_max_c: AtomicU64::new(0),
             motor_mean_c: AtomicU64::new(0),
             motor_hottest: AtomicU32::new(0),
@@ -2241,6 +2263,15 @@ async fn control_loop<T: RobotIo>(
                 if n == 1 || n.is_multiple_of(10) {
                     tracing::warn!(error = %e, consecutive = n, "bus read failed");
                 }
+                // Say it out loud once per run of failures. A duck that has stopped
+                // answering and makes no sound is indistinguishable from one that is not
+                // listening — and the operator is standing over it pressing Start, not
+                // reading a journal. The same moment the run is long enough to act on is
+                // the moment it is long enough to mention; if the reset below succeeds, its
+                // own sentence replaces this one in the single speech slot.
+                if n == auto_recover_ticks {
+                    speak(&mut voice, &mut speech, "fault", Some("alarm"), false);
+                }
                 // A servo that browned out comes back reporting torque off, and the
                 // Feetech driver reads that as a latch: every later read and write is
                 // refused until somebody re-initializes it. One transient therefore
@@ -2329,10 +2360,9 @@ async fn control_loop<T: RobotIo>(
                         since: tick_start,
                         ramp: home_ramp(&params),
                     };
-                    // There is a ramp to wait through, so say what is happening now. From
-                    // home the policy drives on this very tick and only the success
-                    // sentence is worth hearing — two here would cut each other off.
-                    speak(&mut voice, &mut speech, "policy_enabling", Some("chirp"), false);
+                    // Silent: the operator asked for the policy, not a bring-up, and the
+                    // completion chirps ("ready") already say the ramp is over. An opening
+                    // sentence here announced a step nobody had asked for by name.
                 }
             }
         }
@@ -2924,7 +2954,6 @@ async fn control_loop<T: RobotIo>(
                         since: tick_start,
                         ramp,
                     };
-                    speak(&mut voice, &mut speech, "policy_enabling", Some("chirp"), false);
                 }
                 // Reported, not fatal, and it stays `Limp` so the next tick tries again: a bus that
                 // dropped one transaction is ordinary, and a robot that refused to ever come up
@@ -2990,7 +3019,9 @@ async fn control_loop<T: RobotIo>(
                 speak(&mut voice, &mut speech, "policy_enabled", Some("chirp"), false);
             } else {
                 // Three chirps: the operator hears that the bring-up is over without looking
-                // at the robot or a log. The first here, the other two on later ticks.
+                // at the robot or a log. The first here, the other two on later ticks. Then
+                // the words — "ready" — queued by the last chirp's tick, without a call of
+                // its own: the three chirps *are* the call.
                 if let Some(voice) = voice.as_mut() {
                     voice.play("chirp", false);
                 }
@@ -3011,7 +3042,13 @@ async fn control_loop<T: RobotIo>(
                 }
                 next_ramp_call = Some(tick_start + RAMP_CHIRP_GAP);
             } else {
+                // The last gap, so the third chirp has been heard whole: the robot standing
+                // at home and holding is what "ready" means. One slot, so a sentence already
+                // queued (a battery alarm, say) outranks this one.
                 next_ramp_call = None;
+                if speech.is_none() {
+                    say(&mut speech, "ready", Some("chirp"));
+                }
             }
         }
         // A loaded policy change, applied where it is safe to: at the home pose the ramp above
@@ -3596,11 +3633,13 @@ async fn control_loop<T: RobotIo>(
             window_start = Instant::now();
             window_ticks = 0;
 
-            let battery_escalation = publish_slow_sensors(
+            let moving_joints = state.moving.load(Ordering::Relaxed);
+            let battery_notice = publish_slow_sensors(
                 &mut safety,
                 &state,
                 params.safety.battery_warn_v,
                 params.safety.battery_critical_v,
+                moving_joints,
             );
 
             // The low pack is the one failure that looks like every other one from the
@@ -3611,14 +3650,22 @@ async fn control_loop<T: RobotIo>(
             //
             // A step up the ladder (low → critical) speaks at once; a step down (critical
             // → low, on recovery) speaks in the softer sentence at the next repeat.
+            //
+            // Words are for a robot standing still. While the joints are moving the voltage
+            // is reporting the servos' draw, not the pack, so a dip earns one call and
+            // nothing more — the sentence comes at rest, where the reading means something.
             let level = BatteryLevel::from_code(state.battery_level.load(Ordering::Relaxed));
-            if level == BatteryLevel::Normal {
-                last_battery_alarm = None;
-            } else {
-                let escalated = battery_escalation == Some(level);
-                let due = escalated
-                    || last_battery_alarm.is_none_or(|at| at.elapsed() >= BATTERY_WARN_REPEAT);
-                if due {
+            let due = last_battery_alarm.is_none_or(|at| at.elapsed() >= BATTERY_WARN_REPEAT);
+            match battery_notice {
+                Some(BatteryNotice::Sag) => {
+                    if due {
+                        last_battery_alarm = Some(Instant::now());
+                        if let Some(voice) = voice.as_mut() {
+                            voice.play("chirp", false);
+                        }
+                    }
+                }
+                Some(BatteryNotice::Escalated(level)) => {
                     last_battery_alarm = Some(Instant::now());
                     let prompt = match level {
                         BatteryLevel::Critical => "battery_critical",
@@ -3626,6 +3673,20 @@ async fn control_loop<T: RobotIo>(
                     };
                     speak(&mut voice, &mut speech, prompt, Some("alarm"), false);
                 }
+                None if !moving_joints && level == BatteryLevel::Normal => {
+                    last_battery_alarm = None;
+                }
+                None if !moving_joints && due => {
+                    last_battery_alarm = Some(Instant::now());
+                    let prompt = match level {
+                        BatteryLevel::Critical => "battery_critical",
+                        _ => "battery_low",
+                    };
+                    speak(&mut voice, &mut speech, prompt, Some("alarm"), false);
+                }
+                // Moving with a tier already latched: the call above is the whole message
+                // until the robot stands still again.
+                None => {}
             }
 
             if last_summary.elapsed() >= LOOP_SUMMARY_INTERVAL {
@@ -3756,14 +3817,15 @@ fn limit_name(limit: duck_control::safety::Limit) -> &'static str {
 /// corrupt both. The IMU counters come from the same `io`, so they are mirrored here rather
 /// than reached for from the socket.
 ///
-/// Returns the battery tier when this sample just escalated into it, so the loop can speak
-/// without waiting out [`BATTERY_WARN_REPEAT`]; `None` when nothing changed.
+/// Returns what this sample is worth saying out loud (see [`BatteryNotice`]); `None` when
+/// nothing changed.
 fn publish_slow_sensors<T: RobotIo>(
     io: &mut Safety<T>,
     state: &RobotState,
     battery_warn_v: f64,
     battery_critical_v: f64,
-) -> Option<BatteryLevel> {
+    moving: bool,
+) -> Option<BatteryNotice> {
     let stale = io.imu_stale();
     state.imu_stale_blocks.store(stale.total, Ordering::Relaxed);
     state.imu_stale_run.store(stale.run, Ordering::Relaxed);
@@ -3789,17 +3851,30 @@ fn publish_slow_sensors<T: RobotIo>(
             state.battery_v.store(smoothed.to_bits(), Ordering::Relaxed);
 
             // The low-pack warning reads `slow.volts`, not `smoothed`: the whole point is a
-            // sag under load, and the EMA above is precisely what would swallow it.
-            let escalating =
-                track_battery_warning(state, slow.volts, battery_warn_v, battery_critical_v);
-            if let Some(level) = escalating {
-                tracing::warn!(
+            // sag under load, and the EMA above is precisely what would swallow it. Whether
+            // that sag *is* the pack is a separate question, and `moving` is the answer:
+            // a servo-heavy move pulls the rail down for its duration, so a sample taken
+            // mid-move says nothing about the pack.
+            let notice = track_battery_warning(
+                state,
+                slow.volts,
+                battery_warn_v,
+                battery_critical_v,
+                moving,
+            );
+            match notice {
+                Some(BatteryNotice::Escalated(level)) => tracing::warn!(
                     volts = slow.volts,
                     warn_v = battery_warn_v,
                     critical_v = battery_critical_v,
                     ?level,
                     "battery warning — telling the operator"
-                );
+                ),
+                Some(BatteryNotice::Sag) => tracing::debug!(
+                    volts = slow.volts,
+                    "battery sag while the servos move — one call, no sentence"
+                ),
+                None => {}
             }
 
             // Temperature is not smoothed: a servo's case is already a slow signal, and an
@@ -3817,7 +3892,7 @@ fn publish_slow_sensors<T: RobotIo>(
                 .motor_mean_c
                 .store(mean_c.to_bits(), Ordering::Relaxed);
             state.motor_hottest.store(hottest as u32, Ordering::Relaxed);
-            escalating
+            notice
         }
         // Keep the last sample. A single failed transaction is ordinary on a serial bus, and
         // dropping to "unknown" over one would make the reported battery flicker. A bus that
@@ -3829,13 +3904,19 @@ fn publish_slow_sensors<T: RobotIo>(
     }
 }
 
-/// Fold one raw bus voltage into the two low-pack latches, and report a tier the sample just
-/// climbed into (the one worth a log line and an immediate sentence); `None` on a hold or a
-/// recovery.
+/// Fold one raw bus voltage into the two low-pack latches, and report what the sample is
+/// worth saying out loud; `None` on a hold or a recovery.
 ///
 /// On the raw sample and not the EMA, because the failure this exists for is a pack sagging
 /// under a servo-heavy move — exactly what a ten-second average removes. Two samples in a
 /// row before a tier arms, so one dropped transaction cannot start the duck shouting.
+///
+/// A sample taken while the joints are moving is not evidence about the pack at all. The
+/// servos draw the sag: a 4 s stand-up pulls a healthy pack from 7.6 V to 7.1 V for its
+/// duration, and a warning every time the duck stands up is a warning the operator learns to
+/// ignore. So `moving` samples neither arm nor clear a tier; they can only earn one call
+/// ([`BatteryNotice::Sag`]). A pack that is really low still reads low when the robot stands
+/// still, which is when the sentence plays.
 ///
 /// Clearing is not the mirror image of arming: it takes two samples at or above the
 /// threshold plus [`BATTERY_WARN_CLEAR_MARGIN`]. A pack sitting right on the line otherwise
@@ -3848,7 +3929,8 @@ fn track_battery_warning(
     volts: f64,
     warn_v: f64,
     critical_v: f64,
-) -> Option<BatteryLevel> {
+    moving: bool,
+) -> Option<BatteryNotice> {
     let previous = BatteryLevel::from_code(state.battery_level.load(Ordering::Relaxed));
     if !(warn_v > 0.0) {
         state
@@ -3856,6 +3938,7 @@ fn track_battery_warning(
             .store(BatteryLevel::Normal.code(), Ordering::Relaxed);
         state.battery_low_run.store(0, Ordering::Relaxed);
         state.battery_critical_run.store(0, Ordering::Relaxed);
+        state.battery_sag_run.store(0, Ordering::Relaxed);
         return None;
     }
     // `!(volts > 0.0)` and not `volts <= 0.0`: this also swallows a NaN, which must not be
@@ -3863,8 +3946,25 @@ fn track_battery_warning(
     if !(volts > 0.0) {
         state.battery_low_run.store(0, Ordering::Relaxed);
         state.battery_critical_run.store(0, Ordering::Relaxed);
+        state.battery_sag_run.store(0, Ordering::Relaxed);
         return None;
     }
+    if moving {
+        // Hold both latches where they are, and treat a dip as a sag worth one call rather
+        // than a tier crossing. Below the warn line only: a move that stays above it is
+        // telling us nothing.
+        if volts > warn_v {
+            state.battery_sag_run.store(0, Ordering::Relaxed);
+            return None;
+        }
+        let samples = state.battery_sag_run.fetch_add(1, Ordering::Relaxed) + 1;
+        if samples < BATTERY_WARN_SAMPLES {
+            return None;
+        }
+        state.battery_sag_run.store(0, Ordering::Relaxed);
+        return Some(BatteryNotice::Sag);
+    }
+    state.battery_sag_run.store(0, Ordering::Relaxed);
     let low = battery_latch(
         &state.battery_low_run,
         previous >= BatteryLevel::Low,
@@ -3892,7 +3992,7 @@ fn track_battery_warning(
     state
         .battery_level
         .store(level.code(), Ordering::Relaxed);
-    (level > previous).then_some(level)
+    (level > previous).then_some(BatteryNotice::Escalated(level))
 }
 
 /// One tier's debounce and hysteresis. Returns the tier's state after this sample: it arms
@@ -5172,42 +5272,91 @@ mod tests {
         let (_dir, state) = state_over("");
 
         // One sagging read is a dropped transaction, not a flat battery.
-        assert_eq!(track_battery_warning(&state, 7.0, 7.2, 0.0), None);
+        assert_eq!(track_battery_warning(&state, 7.0, 7.2, 0.0, false), None);
         assert_eq!(level(&state), BatteryLevel::Normal);
 
         // The second in a row is the news, and it is news once.
         assert_eq!(
-            track_battery_warning(&state, 7.0, 7.2, 0.0),
-            Some(BatteryLevel::Low)
+            track_battery_warning(&state, 7.0, 7.2, 0.0, false),
+            Some(BatteryNotice::Escalated(BatteryLevel::Low))
         );
         assert_eq!(level(&state), BatteryLevel::Low);
-        assert_eq!(track_battery_warning(&state, 7.0, 7.2, 0.0), None);
+        assert_eq!(track_battery_warning(&state, 7.0, 7.2, 0.0, false), None);
         assert_eq!(level(&state), BatteryLevel::Low);
 
         // Climbing back over the threshold is not recovery: the pack has to clear it by the
         // margin, and stay clear for two samples, before the latch drops.
-        assert_eq!(track_battery_warning(&state, 7.25, 7.2, 0.0), None);
+        assert_eq!(track_battery_warning(&state, 7.25, 7.2, 0.0, false), None);
         assert_eq!(level(&state), BatteryLevel::Low);
-        assert_eq!(track_battery_warning(&state, 7.35, 7.2, 0.0), None);
+        assert_eq!(track_battery_warning(&state, 7.35, 7.2, 0.0, false), None);
         assert_eq!(level(&state), BatteryLevel::Low);
-        assert_eq!(track_battery_warning(&state, 7.35, 7.2, 0.0), None);
+        assert_eq!(track_battery_warning(&state, 7.35, 7.2, 0.0, false), None);
         assert_eq!(level(&state), BatteryLevel::Normal);
 
         // And it can arm again afterwards.
-        assert_eq!(track_battery_warning(&state, 7.0, 7.2, 0.0), None);
+        assert_eq!(track_battery_warning(&state, 7.0, 7.2, 0.0, false), None);
         assert_eq!(
-            track_battery_warning(&state, 7.0, 7.2, 0.0),
-            Some(BatteryLevel::Low)
+            track_battery_warning(&state, 7.0, 7.2, 0.0, false),
+            Some(BatteryNotice::Escalated(BatteryLevel::Low))
         );
 
         // Zero volts means *not read yet*, never "flat" — and it is not evidence of recovery
         // either, so a warning that is already up stays up through a missing reading.
-        assert_eq!(track_battery_warning(&state, 0.0, 7.2, 0.0), None);
+        assert_eq!(track_battery_warning(&state, 0.0, 7.2, 0.0, false), None);
         assert_eq!(level(&state), BatteryLevel::Low);
 
         // Zero threshold disables it and drops any latch that was up.
-        assert_eq!(track_battery_warning(&state, 7.0, 0.0, 0.0), None);
+        assert_eq!(track_battery_warning(&state, 7.0, 0.0, 0.0, false), None);
         assert_eq!(level(&state), BatteryLevel::Normal);
+    }
+
+    /// **A voltage sag under a moving servo is not a flat pack.** A 4 s stand-up pulls a
+    /// healthy pack well below the warn line for its duration; a "电量低" every time the duck
+    /// stands up teaches the operator to ignore the warning. While the joints move the tier
+    /// must not arm — at most one call — and the same reading at rest is the news.
+    #[test]
+    fn a_sag_while_the_servos_move_is_a_call_not_a_warning() {
+        let (_dir, state) = state_over("");
+
+        // Two samples under load earn one call, and no tier.
+        assert_eq!(track_battery_warning(&state, 7.0, 7.4, 7.0, true), None);
+        assert_eq!(
+            track_battery_warning(&state, 7.0, 7.4, 7.0, true),
+            Some(BatteryNotice::Sag)
+        );
+        assert_eq!(level(&state), BatteryLevel::Normal);
+
+        // The rest of the ramp: still nothing, even down at critical volts.
+        for _ in 0..3 {
+            let _ = track_battery_warning(&state, 6.8, 7.4, 7.0, true);
+            assert_eq!(level(&state), BatteryLevel::Normal);
+        }
+
+        // Standing still, the same pack tells the truth: two samples and it is news.
+        assert_eq!(track_battery_warning(&state, 7.2, 7.4, 7.0, false), None);
+        assert_eq!(
+            track_battery_warning(&state, 7.2, 7.4, 7.0, false),
+            Some(BatteryNotice::Escalated(BatteryLevel::Low))
+        );
+        assert_eq!(level(&state), BatteryLevel::Low);
+    }
+
+    /// **Moving samples do not clear a tier either.** A pack already known to be low stays
+    /// low through a walk: missing readings and load-bound readings are both evidence of
+    /// neither state.
+    #[test]
+    fn moving_samples_neither_arm_nor_clear() {
+        let (_dir, state) = state_over("");
+        assert_eq!(track_battery_warning(&state, 7.2, 7.4, 7.0, false), None);
+        assert_eq!(
+            track_battery_warning(&state, 7.2, 7.4, 7.0, false),
+            Some(BatteryNotice::Escalated(BatteryLevel::Low))
+        );
+
+        // Recovered by the clear margin, but the joints are moving: the latch holds.
+        assert_eq!(track_battery_warning(&state, 7.6, 7.4, 7.0, true), None);
+        assert_eq!(track_battery_warning(&state, 7.6, 7.4, 7.0, true), None);
+        assert_eq!(level(&state), BatteryLevel::Low);
     }
 
     /// **A pack sitting on the threshold does not make the duck chatty.** Voltages wobbling
@@ -5217,15 +5366,15 @@ mod tests {
     #[test]
     fn a_battery_sitting_on_the_threshold_speaks_once() {
         let (_dir, state) = state_over("");
-        assert_eq!(track_battery_warning(&state, 7.49, 7.5, 0.0), None);
+        assert_eq!(track_battery_warning(&state, 7.49, 7.5, 0.0, false), None);
         assert_eq!(
-            track_battery_warning(&state, 7.49, 7.5, 0.0),
-            Some(BatteryLevel::Low)
+            track_battery_warning(&state, 7.49, 7.5, 0.0, false),
+            Some(BatteryNotice::Escalated(BatteryLevel::Low))
         );
 
         for volts in [7.51, 7.47, 7.52, 7.46, 7.50, 7.44, 7.53, 7.48, 7.49, 7.51, 7.46, 7.50] {
             assert_eq!(
-                track_battery_warning(&state, volts, 7.5, 0.0),
+                track_battery_warning(&state, volts, 7.5, 0.0, false),
                 None,
                 "{volts} re-armed"
             );
@@ -5233,9 +5382,9 @@ mod tests {
         }
 
         // Clear by the margin for two samples and it finally goes quiet.
-        assert_eq!(track_battery_warning(&state, 7.62, 7.5, 0.0), None);
+        assert_eq!(track_battery_warning(&state, 7.62, 7.5, 0.0, false), None);
         assert_eq!(level(&state), BatteryLevel::Low);
-        assert_eq!(track_battery_warning(&state, 7.62, 7.5, 0.0), None);
+        assert_eq!(track_battery_warning(&state, 7.62, 7.5, 0.0, false), None);
         assert_eq!(level(&state), BatteryLevel::Normal);
     }
 
@@ -5248,39 +5397,39 @@ mod tests {
         let (_dir, state) = state_over("");
 
         // Straight from normal to critical: both latches arm on the same second sample.
-        assert_eq!(track_battery_warning(&state, 6.9, 7.4, 7.0), None);
+        assert_eq!(track_battery_warning(&state, 6.9, 7.4, 7.0, false), None);
         assert_eq!(
-            track_battery_warning(&state, 6.9, 7.4, 7.0),
-            Some(BatteryLevel::Critical)
+            track_battery_warning(&state, 6.9, 7.4, 7.0, false),
+            Some(BatteryNotice::Escalated(BatteryLevel::Critical))
         );
         assert_eq!(level(&state), BatteryLevel::Critical);
 
         // Holding at critical is not news after the first sample.
-        assert_eq!(track_battery_warning(&state, 6.8, 7.4, 7.0), None);
+        assert_eq!(track_battery_warning(&state, 6.8, 7.4, 7.0, false), None);
 
         // Back above the critical clear mark (7.1 V) but below the low one (7.5 V): the pack
         // has recovered one tier, quietly, and the softer sentence gets said next repeat.
-        assert_eq!(track_battery_warning(&state, 7.15, 7.4, 7.0), None);
-        assert_eq!(track_battery_warning(&state, 7.15, 7.4, 7.0), None);
+        assert_eq!(track_battery_warning(&state, 7.15, 7.4, 7.0, false), None);
+        assert_eq!(track_battery_warning(&state, 7.15, 7.4, 7.0, false), None);
         assert_eq!(level(&state), BatteryLevel::Low);
 
         // Falling back under 7.0 V steps up again, and that is news.
-        assert_eq!(track_battery_warning(&state, 6.95, 7.4, 7.0), None);
+        assert_eq!(track_battery_warning(&state, 6.95, 7.4, 7.0, false), None);
         assert_eq!(
-            track_battery_warning(&state, 6.95, 7.4, 7.0),
-            Some(BatteryLevel::Critical)
+            track_battery_warning(&state, 6.95, 7.4, 7.0, false),
+            Some(BatteryNotice::Escalated(BatteryLevel::Critical))
         );
 
         // Cleared for good only above the low tier's mark, two samples running.
-        assert_eq!(track_battery_warning(&state, 7.55, 7.4, 7.0), None);
-        assert_eq!(track_battery_warning(&state, 7.55, 7.4, 7.0), None);
+        assert_eq!(track_battery_warning(&state, 7.55, 7.4, 7.0, false), None);
+        assert_eq!(track_battery_warning(&state, 7.55, 7.4, 7.0, false), None);
         assert_eq!(level(&state), BatteryLevel::Normal);
 
         // A disabled critical tier never says the urgent sentence: 6.5 V is still only Low.
-        assert_eq!(track_battery_warning(&state, 6.5, 7.4, 0.0), None);
+        assert_eq!(track_battery_warning(&state, 6.5, 7.4, 0.0, false), None);
         assert_eq!(
-            track_battery_warning(&state, 6.5, 7.4, 0.0),
-            Some(BatteryLevel::Low)
+            track_battery_warning(&state, 6.5, 7.4, 0.0, false),
+            Some(BatteryNotice::Escalated(BatteryLevel::Low))
         );
     }
 

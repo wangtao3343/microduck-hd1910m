@@ -273,6 +273,9 @@ mode = "walk"
 # smooths one away. Two samples in a row past a threshold before it counts; each tier clears
 # after two samples 0.1 V back above its line. A tier repeats about every 30 s while it
 # lasts, and falling from the first into the second speaks at once. Zero disables a tier.
+# Only while the servos are still: a move draws the sag (a 4 s stand-up pulls a healthy pack
+# from 7.6 V to 7.1 V), so a mid-move sample arms nothing and at most earns one call. The
+# sentences play at rest, where the reading is about the pack rather than the motors.
 # It is only a warning — nothing is commanded, nothing is stopped.
 #
 # 7.4 V is 3.70 V per cell and about 50% on the linear scale: the nominal Li-ion voltage,
@@ -313,9 +316,9 @@ mode = "walk"
 # Where the voice bank lives.
 # bank = "/var/lib/robot/sounds"
 
-# Where the fixed spoken prompts live: boot.wav, policy_enabling.wav, policy_enabled.wav,
-# policy_paused.wav, relax.wav, battery_low.wav, battery_critical.wav, fault_reset.wav,
-# shutdown.wav, battery_empty.wav.
+# Where the fixed spoken prompts live: boot.wav, ready.wav, policy_enabled.wav,
+# policy_paused.wav, relax.wav, battery_low.wav, battery_critical.wav,
+# fault.wav, fault_reset.wav, shutdown.wav, battery_empty.wav.
 # These are sentences, not bank variants — one known file per event, played verbatim. Kept
 # outside the bank because `sounds ensure-bank` replaces that directory. A missing file
 # falls back to the duck call that event used before, so an unprovisioned board is only

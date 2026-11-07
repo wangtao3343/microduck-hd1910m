@@ -40,13 +40,14 @@ while IFS='|' read -r name text; do
     -ar 48000 -ac 1 -c:a pcm_s16le "$OUT/$name.wav" </dev/null
   printf '%-14s %s\n' "$name" "$text"
 done <<'EOF'
-boot|开机完成，我准备好了
-policy_enabling|准备
+boot|开机完成
+ready|准备
 policy_enabled|解锁
 policy_paused|锁定
 relax|我累了，休息一下
-battery_low|电量低了，快给我充电
+battery_low|电量低
 battery_critical|我快要噶了，立即给我充电
+fault|伺服故障，请检查
 fault_reset|伺服故障，已复位，请按开始键继续
 shutdown|正在关机
 battery_empty|电量耗尽，即将关机
