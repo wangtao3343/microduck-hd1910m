@@ -19,6 +19,15 @@ use anyhow::{Context, Result, bail};
 use sherpa_rs::sherpa_rs_sys as sys;
 
 use crate::audio::MODEL_RATE;
+use crate::intent;
+
+/// Per-token bonus for a vocabulary phrase, in log-probability units.
+///
+/// Three is deliberately strong: at one the beam still preferred 叫医生 for 叫一声 because
+/// its language model likes a real word. The cost of being wrong in this direction is a
+/// command heard in speech that did not mean it — acceptable for a vocabulary this small
+/// and this unambiguous, and bounded by the deaf window for anything the duck says itself.
+const HOTWORD_SCORE: f32 = 3.0;
 
 /// The files a streaming zipformer is made of. Fixed names because the model directory is
 /// a release artifact with one layout, not a place to guess from: a renamed encoder should
@@ -58,7 +67,15 @@ impl Recognizer {
         let decoder = path(DECODER)?;
         let joiner = path(JOINER)?;
         let tokens = path(TOKENS)?;
-        let decoding = CString::new("greedy_search")?;
+        // Beam search, not greedy: hotword scores only exist in the beam search, and the
+        // hotwords are what keep 叫一声 from arriving as 叫医生 (measured — see
+        // `intent::hotwords`). The model is small, so a beam of four is cheap.
+        let decoding = CString::new("modified_beam_search")?;
+        // Required whenever hotwords are given: sherpa-onnx splits a hotword into tokens by
+        // this name and exits the process for an unknown one. This model's table is one
+        // Chinese character per token.
+        let modeling_unit = CString::new("cjkchar")?;
+        let hotwords = CString::new(intent::hotwords())?;
 
         // Every pointer field starts null, and the C API's `SHERPA_ONNX_OR` treats null as
         // "use the default" — this is the one place where a zeroed C struct is the intended
@@ -71,8 +88,12 @@ impl Recognizer {
         config.model_config.transducer.joiner = joiner.as_ptr();
         config.model_config.tokens = tokens.as_ptr();
         config.model_config.num_threads = threads;
+        config.model_config.modeling_unit = modeling_unit.as_ptr();
         config.decoding_method = decoding.as_ptr();
         config.max_active_paths = 4;
+        config.hotwords_buf = hotwords.as_ptr();
+        config.hotwords_buf_size = hotwords.as_bytes().len() as i32;
+        config.hotwords_score = HOTWORD_SCORE;
         config.enable_endpoint = 1;
         config.rule1_min_trailing_silence = 2.4;
         config.rule2_min_trailing_silence = 1.2;

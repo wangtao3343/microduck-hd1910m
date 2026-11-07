@@ -78,6 +78,28 @@ pub fn parse(text: &str) -> Option<Command> {
         .map(|(command, _)| *command)
 }
 
+/// The vocabulary as sherpa-onnx hotwords: one phrase per line, fed to the beam search.
+///
+/// Measured on the board, not guessed at: with plain greedy search the 14M model
+/// transcribed 叫一声 as 叫医生 — the same pinyin, the wrong characters, and so no match —
+/// and 叫一声 as 下一声. A hotword is a per-token score bonus for the tokens of the phrase
+/// while they are being decoded, which is exactly the lever for "the acoustics are close,
+/// the characters are not".
+///
+/// **Single-character phrases are left out.** 停 is in the vocabulary, but a one-character
+/// hotword is one token of bonus and every 听/挺/厅 in the room pays for it. The others are
+/// covered by 停下 in any case.
+pub fn hotwords() -> String {
+    let mut text = String::new();
+    for (_, phrases) in VOCABULARY {
+        for phrase in phrases.iter().filter(|p| p.chars().count() > 1) {
+            text.push_str(phrase);
+            text.push('\n');
+        }
+    }
+    text
+}
+
 /// Drop everything that is not a meaningful character: whitespace, ASCII punctuation, and the
 /// full-width forms the recogniser emits. Case-folded so an English "OK"-style token could
 /// never collide by accident.
@@ -175,5 +197,26 @@ mod tests {
         assert_eq!(parse("今天天气不错"), None);
         assert_eq!(parse(""), None);
         assert_eq!(parse("......"), None);
+    }
+
+    #[test]
+    fn every_multi_character_phrase_is_a_hotword() {
+        // The decoder and the matcher must agree on what the phrases are; if they drift,
+        // the hotword biases toward something `parse` would not accept.
+        let hotwords = hotwords();
+        for (_, phrases) in VOCABULARY {
+            for phrase in *phrases {
+                let listed = hotwords.lines().any(|line| line == *phrase);
+                assert_eq!(
+                    listed,
+                    phrase.chars().count() > 1,
+                    "phrase {phrase:?} listed = {listed}"
+                );
+            }
+        }
+        // And the hotword file's lines really are the vocabulary, not a superset.
+        for line in hotwords.lines() {
+            assert!(parse(line).is_some(), "hotword {line:?} is not a command");
+        }
     }
 }
