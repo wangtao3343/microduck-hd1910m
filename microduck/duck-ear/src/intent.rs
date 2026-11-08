@@ -72,6 +72,35 @@ const VOCABULARY: &[(Command, &[&str])] = &[
     ),
 ];
 
+/// The names a person calls the duck by. Ordered longest first so 小鸭子 is not read as 小鸭
+/// plus a stray 子.
+///
+/// A sentence that contains one of these is a **remark**, not a command: the daemon answers
+/// it (`brain`) and speaks the answer (`speak`), and the rest of the sentence is what it was
+/// said to. The wake word exists because the alternative — answer everything the microphone
+/// segments — would make the duck talk back to the television six times an evening.
+/// The homophones are there because the recognizer writes what it hears: a quiet "小鸭，你好吗"
+/// came back as "哇我好吗", and a "小鸭子" as "小呀小鸭". 小鸭 and 鸭子 are the two that matter;
+/// the rest are cheap insurance.
+pub const WAKE: &[&str] = &[
+    "小鸭子", "小鸭", "小呀", "小亚", "小丫", "小牙", "小雅", "鸭鸭", "鸭子",
+];
+
+/// The part of the sentence addressed to the duck, or `None` if it was not addressed to it.
+///
+/// An empty string means the person only said the name ("小鸭？"): the caller's cue to answer
+/// without asking a model anything.
+pub fn remark(text: &str) -> Option<String> {
+    let normalized = normalize(text);
+    // Several names can match the same sentence — "小呀小鸭" holds both 小呀 and 小鸭 — so
+    // take the one that leaves the least behind: the recognizer puts the name where the
+    // person put it, and a name at the end of the sentence should not become a remark.
+    WAKE.iter()
+        .filter_map(|name| normalized.split_once(name))
+        .map(|(_, rest)| rest.to_owned())
+        .min_by_key(|rest| rest.chars().count())
+}
+
 /// What the sentence means, or `None` for "not a command".
 pub fn parse(text: &str) -> Option<Command> {
     let normalized = normalize(text);
@@ -183,4 +212,25 @@ mod tests {
         assert_eq!(parse("......"), None);
     }
 
+    #[test]
+    fn the_name_splits_a_remark_from_the_service() {
+        assert_eq!(remark("小鸭，你好吗").as_deref(), Some("你好吗"));
+        assert_eq!(remark("小鸭子你在干什么").as_deref(), Some("你在干什么"));
+        assert_eq!(remark("你好呀鸭子").as_deref(), Some(""));
+        // The name alone is a greeting, not a question. What the recognizer actually
+        // returns for a quiet "小鸭子，你在干什么" is 小呀小鸭 — both names match, and the
+        // answer is the match that leaves nothing behind.
+        assert_eq!(remark("小鸭？").as_deref(), Some(""));
+        assert_eq!(remark("小呀小鸭。").as_deref(), Some(""));
+        assert_eq!(remark("小亚你好").as_deref(), Some("你好"));
+        assert_eq!(remark("今天天气不错"), None);
+    }
+
+    #[test]
+    fn a_command_with_the_name_in_front_is_still_a_command() {
+        // Commands win: 1.5 s of local matching against 2 s of network and inference, and
+        // "小鸭坐下" is not a request for an opinion about sitting.
+        assert_eq!(parse("小鸭坐下"), Some(Command::SitToggle));
+        assert_eq!(remark("小鸭坐下").as_deref(), Some("坐下"));
+    }
 }

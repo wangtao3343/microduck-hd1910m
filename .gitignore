@@ -27,3 +27,8 @@
 /microduck_app/web/
 /microduck_app/android/
 /vendor/
+
+# 主机上的 TTS 服务：脚本进仓库，模型（每个 130–180 MB）和解释器是本地产物
+/tools/duck-tts/models/
+/tools/duck-tts/*.log
+/tools/duck-tts/*.tar.bz2

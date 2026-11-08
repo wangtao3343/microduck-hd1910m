@@ -1,15 +1,21 @@
 # Voice control
 
-Status: implemented 2026-11-07 · crate `duck-ear` · planning doc
-[`docs/语音交互方案.md`](../../../docs/语音交互方案.md)
+Status: implemented 2026-11-07, conversation 2026-11-08 · crate `duck-ear` · planning doc
+[`docs/语音交互方案.md`](../../../docs/语音交互方案.md) · operations
+[`docs/语音对话操作.md`](../../../docs/语音对话操作.md)
 
-Speaking a Chinese command to the duck moves it. Everything on the instruction path is
-local: the microphone, the recognizer, the vocabulary, the intent. Nothing is uploaded.
+Speaking a Chinese command to the duck moves it, and addressing it by name starts a
+conversation. Everything on the instruction path is local: the microphone, the recognizer,
+the vocabulary, the intent. Nothing is uploaded. A remark — text, not audio — goes to a model
+on the user's workstation over the LAN and comes back as speech.
 
 ```
 arecord (48 kHz stereo, right channel) → 16 kHz mono → Silero VAD (utterance boundaries)
-   → sherpa-onnx offline SenseVoice → transcript → vocabulary
-   → robot.move / robot.do / robot.sound / robot.stop
+   → sherpa-onnx offline SenseVoice → transcript
+        ├─ command vocabulary            → robot.move / robot.do / robot.sound / robot.stop
+        └─ contains 小鸭 ("remark")      → POST 192.168.3.11:11434/api/chat
+                                         ← reply text
+                                         → GET 192.168.3.11:8100/say → WAV → aplay
 ```
 
 ## What it listens with
@@ -110,6 +116,82 @@ the clipping point, so the vocabulary does not need a level gate in front of it.
 is not covered by the deaf window. Those sentences are not commands either, so the worst
 case is a spurious transcript in the journal, not motion.
 
+## Conversation
+
+A sentence that is not a command is answered if it contains one of the duck's names
+(`小鸭`, `小鸭子`, `鸭鸭`, `鸭子` — `intent::remark` strips it and keeps the rest), or if it
+arrives within 45 s of the last answer. Without that window a conversation would need the name
+before every sentence; without the name every sentence in the room would be answered. Commands
+are checked first and always win — the fixed vocabulary is the only speaker in this process
+allowed to move the robot, and 小鸭坐下 is a command, not a question about sitting. Saying only
+the name is answered with 我在 without asking a model anything.
+
+The model does not run on the board. `brain.rs` is a blocking `POST /api/chat` to Ollama on
+the workstation (`qwen3.5:9b`, measured 2 s warm, 8 s cold; the 27B model measured 15 s and is
+unusable for speech). Three request settings: `stream: false` because the answer is spoken as
+a whole sentence; `think: false` because Qwen3.5's hidden reasoning costs seconds nobody hears;
+`keep_alive: 30m` because Ollama unloads after five idle minutes and a conversation has longer
+pauses. History is six messages — enough for pronouns to resolve, bounded so a long session
+does not grow the prompt. The user message is rolled back when a request fails, so an
+unanswered question is not left in the history. At startup a one-token request warms the model
+on a thread of its own: a host that is down logs a warning and does not keep the ear from
+starting.
+
+Speech is synthesized on the host too. VITS (fanchen-C) measured **RTF 8.8–13** on the board's
+A55 — a two-second sentence took nineteen seconds — against **0.4** on the host, so
+`speak.rs` fetches `GET /say?text=…`, writes the WAV to `$TMPDIR/duck-ear-reply.wav`, and
+plays it with `aplay` through the codec's `plughw`. The reply is a file, which `robot.sound`
+cannot play, so this daemon owns the speaker for the length of the answer.
+
+The voice went through three: fanchen-C (too cartoonish), MeloTTS zh+en (natural, but still a
+stranger), and now **F5-TTS cloning the duck's own prompt bank** — a 4-second clip of
+`fault_reset.wav` from `/var/lib/robot/prompts` plus its transcript, zero-shot, on the host's
+3060. That is what "sound like the boot prompt" means: not a better synthetic voice but *that*
+voice. Three settings are load-bearing: `nfe_step 32` (16 measured 1.1 s against 1.6 s and was
+audibly rougher), 24 kHz (the model's own rate), and a **2-semitone lowering** through ffmpeg
+`rubberband` (`F5_PITCH=0.891`), because the clone comes out higher than the reference; the
+shift keeps duration, costs tens of milliseconds, and drops the level about 10 %, so peak
+normalisation runs after it. Warm synthesis is RTF ≈ 0.4 — 2.3 s for a 4.6 s line, about a
+second slower than MeloTTS and 1.2 GB of VRAM beside Ollama's 6.5. `serve.py` still carries
+melo and fanchen behind the same HTTP contract if the GPU or the torch stack is unavailable.
+
+Two measurements worth keeping: MeloTTS **int8** ran at RTF 2.1 on the host while fp32 ran at
+0.13 — this Xeon is Broadwell, without VNNI, and quantized kernels take a slow path; and every
+voice's output is peak-normalized to 0.85, because the models emit quiet audio (peak 0.1–0.2)
+that the duck's small speaker cannot make audible. That cannot cause self-hearing because the
+microphone is off while a reply plays.
+
+`net.rs` is the HTTP/1.1 client: `Connection: close`, read to end of stream, chunked framing
+decoded when present, and a single deadline for the whole exchange rather than a per-read
+timeout. It exists instead of `reqwest` because this daemon's loop is blocking audio reads and
+an async runtime would buy it nothing.
+
+The microphone is not read while the exchange runs — the duck cannot hear its own reply, and
+there is nothing useful to do with the audio during two seconds of inference. When the answer
+ends, a 600 ms deaf window discards the pipe's tail (well under half a second) and the
+segmenter is reset. The price is that a person talking over the reply is not heard at all; the
+alternative was the duck answering its own voice.
+
+A host that cannot be reached is not allowed to look like a deaf duck. When the brain request
+fails, the daemon answers with a fixed sentence (我连不上电脑了，请检查一下。); when the voice
+request fails, it plays the same sentence **from inside the binary** — synthesized once with
+the same cloned voice, 24 kHz mono, 2.9 s, 140 kB (`assets/host_offline.wav`, `include_bytes!`
+in `main.rs`), through the same `aplay` path. That is the crux: the TTS is the thing that is
+missing, so a sentence about missing it cannot be synthesized at that moment. Only if neither
+plays does the duck honk — `robot.sound { tag: "alarm" }`, which needs nothing but robotd and
+is deliberately not the `chirp` that acknowledges a command, so a person can tell "done" from
+"I could not reach the computer". Silence was the one outcome worth engineering away: with no
+reply and no sound, a person cannot tell a broken network from a dead microphone.
+
+The conversation window is extended only by an answer the person actually heard. With a
+working voice every answer re-arms the 45 s window; with a broken one, re-arming would answer
+everything in the room for as long as the network stays down — a duck holding a conversation
+with a television.
+
+Both halves are optional at the command line: `--brain ""` disables conversation entirely,
+`--tts ""` logs answers instead of speaking them, and a host that is offline costs remarks,
+never commands.
+
 ## Deployment
 
 Board artifacts, none of which ship in the release:
@@ -119,6 +201,10 @@ Board artifacts, none of which ship in the release:
 | model (`model.int8.onnx`, `tokens.txt`) | `/var/lib/robot/asr/sensevoice` | 240 MB, changes yearly |
 | VAD (`silero_vad.onnx`) | `/var/lib/robot/asr/silero_vad.onnx` | 1.8 MB, from the same sherpa-onnx release |
 | `libsherpa-onnx-c-api.so`, `libonnxruntime.so` | next to `duck-ear` | see below |
+
+The host side — Ollama and the TTS service in `tools/duck-tts` — ships with nothing and is
+installed by hand; [`docs/语音对话操作.md`](../../../docs/语音对话操作.md) has the steps and the
+default addresses (`192.168.3.11:11434` and `:8100`) are the binary's flag defaults.
 
 The two libraries are the sherpa-onnx release's `linux-aarch64-shared-cpu` build. They
 carry **their own ONNX Runtime**, which is a different version from the 1.28 `robotd`
