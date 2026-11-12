@@ -134,7 +134,7 @@ const ghostRoot = new THREE.Group(), ghostJoints = {};
 ghostRoot.name = 'official-pose-ghost'; ghostRoot.visible = false; trunkAttitude.add(ghostRoot);
 const ghostMat = new THREE.MeshStandardMaterial({ color: 0x5aa9ff, transparent: true, opacity: 0.28, depthWrite: false, roughness: 0.8 });
 
-const joints = {};   // servo id -> {pivot, axis, dir}
+const joints = {};   // 关节名 -> {pivot, axis}。用名字不用 ID：换了编号模型不用重新生成
 const hud = document.getElementById('viewHud');
 const massInfo = [], soleInfo = [];   // 重心：每个 body 的质量/质心；脚底：sole 网格包围盒角点（踝体系）
 let comMark = null, comLine = null, comRing = null, soleLoops = [], supportBox = null, comText = document.createElement('div');
@@ -210,7 +210,7 @@ async function loadModel() {
     let inner = node;
     if (b.joint) {
       const pivot = new THREE.Group(); pivot.name = 'joint:' + b.joint.name; node.add(pivot); inner = pivot;
-      if (b.joint.id != null) joints[b.joint.id] = { pivot, axis: new THREE.Vector3(...b.joint.axis).normalize(), name: b.joint.name };
+      if (b.joint.id != null) joints[b.joint.name] = { pivot, axis: new THREE.Vector3(...b.joint.axis).normalize(), name: b.joint.name };
     }
     for (const g of b.geoms) {
       const mat = new THREE.MeshStandardMaterial({
@@ -238,7 +238,7 @@ async function loadModel() {
     let inner = node;
     if (b.joint) {
       const pivot = new THREE.Group(); node.add(pivot); inner = pivot;
-      if (b.joint.id != null) ghostJoints[b.joint.id] = { pivot, axis: new THREE.Vector3(...b.joint.axis).normalize() };
+      if (b.joint.id != null) ghostJoints[b.joint.name] = { pivot, axis: new THREE.Vector3(...b.joint.axis).normalize() };
     }
     for (const g of b.geoms) {
       const mesh = new THREE.Mesh(geoms[g.mesh], ghostMat); mesh.renderOrder = 2;
@@ -260,7 +260,9 @@ let lastPoseSig = '', lastTrunkSig = '', needRender = true;
 controls.addEventListener('change', () => { needRender = true; });
 function pose() {
   let sig = showWhat;
-  for (const [id, j] of Object.entries(joints)) {
+  // 模型里的关节按名字对；读数、± 都是按编号存的，这里用当前编号换过去
+  for (const [name, j] of Object.entries(joints)) {
+    const id = NAME2ID[name]; if (id === undefined) continue;
     const src = showWhat === 'goal' ? goalPos : rawPos;
     const raw = src[id]; if (raw === undefined) continue;
     const ang = (raw - 2048) * RAD * (dirs[id] || 1);
@@ -270,7 +272,7 @@ function pose() {
   // 官方姿势直接是模型约定的弧度，不经过舵机读数和 ±
   const key = window.duckGhost, official = key && OFFICIAL_POSES[key];
   ghostRoot.visible = !!official;
-  if (official) for (const [id, j] of Object.entries(ghostJoints)) j.pivot.quaternion.setFromAxisAngle(j.axis, official.rad[id] ?? 0);
+  if (official) for (const [name, j] of Object.entries(ghostJoints)) j.pivot.quaternion.setFromAxisAngle(j.axis, official.rad[name] ?? 0);
   sig += '|' + (key || '');
   if (sig === lastPoseSig) return false;
   lastPoseSig = sig; return true;

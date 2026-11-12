@@ -1,0 +1,26 @@
+{
+ "_note": "servo-web 的舵机表。ID 不写在这里 —— 唯一真源是 installation 指向的 radxa/installation.json（robotd 读的也是它）。这里只放 ID 以外、网页要用的东西：中文名、分组、显示顺序。换舵机编号只改 installation.json 一处，网页、3D、姿态、校准、报表都跟着变。servos 里漏写的关节会按 installation.json 的顺序补在后面，中文名就用英文名；installation.json 里没有的会提示一句然后跳过。",
+ "installation": "../../radxa/installation.json",
+ "groups": [
+  {"key": "left_leg", "label": "左腿"},
+  {"key": "head", "label": "颈 / 头 / 嘴"},
+  {"key": "right_leg", "label": "右腿"}
+ ],
+ "servos": [
+  {"name": "left_hip_yaw", "cn": "左髋 yaw", "group": "left_leg"},
+  {"name": "left_hip_roll", "cn": "左髋 roll", "group": "left_leg"},
+  {"name": "left_hip_pitch", "cn": "左髋 pitch", "group": "left_leg"},
+  {"name": "left_knee", "cn": "左膝", "group": "left_leg"},
+  {"name": "left_ankle", "cn": "左踝", "group": "left_leg"},
+  {"name": "neck_pitch", "cn": "颈 pitch", "group": "head"},
+  {"name": "head_pitch", "cn": "头 pitch", "group": "head"},
+  {"name": "head_yaw", "cn": "头 yaw", "group": "head"},
+  {"name": "head_roll", "cn": "头 roll", "group": "head"},
+  {"name": "mouth", "cn": "嘴", "group": "head"},
+  {"name": "right_hip_yaw", "cn": "右髋 yaw", "group": "right_leg"},
+  {"name": "right_hip_roll", "cn": "右髋 roll", "group": "right_leg"},
+  {"name": "right_hip_pitch", "cn": "右髋 pitch", "group": "right_leg"},
+  {"name": "right_knee", "cn": "右膝", "group": "right_leg"},
+  {"name": "right_ankle", "cn": "右踝", "group": "right_leg"}
+ ]
+}

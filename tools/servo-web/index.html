@@ -9,6 +9,7 @@
 <body>
 <header>
   <h1>🦆 舵机调试台 <span class="muted" id="ver" style="font-size:11px;font-weight:400"></span></h1>
+  <span class="muted" id="idSrc" style="font-size:11px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
   <span><span class="dot" id="dot"></span><span id="conn">连接中</span></span>
   <span style="display:flex;gap:14px;font-size:13px"><span>在线 <b id="stOnline">–</b></span><span>刷新 <b id="stHz">–</b></span><span>电压 <b id="stVolt">–</b></span><span>电流峰值 <b id="stPeak" style="cursor:pointer" onclick="peakReset()" title="点一下清零；点官方姿势按钮也会自动清零">–</b></span></span>
   <span class="muted" id="busInfo" style="font-size:12px"></span>
@@ -22,7 +23,7 @@
     <button onclick="syncSliders()">滑块对齐当前位置</button>
     <button onclick="centerAll()" title="零位 = 腿伸直、脚板垂直、头平视、嘴闭上，官方定义这时每颗都是 2048">全部回零位（2048）</button>
     <button onclick="standPose()" title="poses/ 里名字带「站姿」的姿态（实机调好的）；没有才用官方 DEFAULT_POSITION 换算">站姿</button>
-    <button id="idleBtn" onclick="toggleIdle()" title="头部随机小动作：歪头、摇头、点头、张嘴、左右看。以按下时的头部位置为中心，幅度不大，只动 11–15">🦆 灵动</button>
+    <button id="idleBtn" onclick="toggleIdle()" title="头部随机小动作：歪头、摇头、点头、张嘴、左右看。以按下时的头部位置为中心，幅度不大，只动颈 / 头 / 嘴">🦆 灵动</button>
     <button onclick="send({op:'scan'})">重新扫描</button>
     <label class="muted">跟随拖动 <input type="checkbox" id="live" checked></label>
   </div>
@@ -147,7 +148,7 @@
             <div class="row">
               <button onclick="send({op:'timing', n:200})">sync_read 时序测试 ×200</button>
               <button onclick="if(confirm('扫 0–253 全部 ID，约 6 秒'))send({op:'scan_all'})">全网扫描 0–253</button>
-              <button onclick="send({op:'scan', ids:prompt('ID 列表','1-15')})">扫指定 ID</button>
+              <button onclick="send({op:'scan', ids:prompt('ID 列表', ids.join(',') || '1-15')})">扫指定 ID</button>
             </div>
             <div id="timing" class="muted"></div>
           </section>
@@ -196,9 +197,9 @@
     </div>
 
     <div id="servoStrip">
-      <section><h2><span title="左腿 6–10">左腿 6–10</span> <span class="muted h2note" style="font-weight:400" title="±：关节方向，存在 directions.json，影响 3D、站姿、序列、灵动，不动舵机">±：关节方向，存在 directions.json，影响 3D、站姿、序列、灵动，不动舵机</span> <button onclick="copyRobotdDirs()" title="复制 robotd 方向表到剪贴板" style="font-size:11px;padding:2px 7px">复制方向表</button></h2><div id="g20"></div></section>
-      <section><h2>颈 / 头 / 嘴 11–15</h2><div id="g30"></div></section>
-      <section><h2>右腿 1–5</h2><div id="g10"></div></section>
+      <section><h2><span id="h_left_leg" title="编号来自 radxa/installation.json">左腿</span> <span class="muted h2note" style="font-weight:400" title="±：关节方向，存在 directions.json，影响 3D、站姿、序列、灵动，不动舵机">±：关节方向，存在 directions.json，影响 3D、站姿、序列、灵动，不动舵机</span> <button onclick="copyRobotdDirs()" title="复制 robotd 方向表到剪贴板" style="font-size:11px;padding:2px 7px">复制方向表</button></h2><div id="g20"></div></section>
+      <section><h2><span id="h_head">颈 / 头 / 嘴</span></h2><div id="g30"></div></section>
+      <section><h2><span id="h_right_leg">右腿</span></h2><div id="g10"></div></section>
       <section id="other" style="display:none"><h2>其它 ID</h2><div id="gx"></div></section>
     </div>
   </div>

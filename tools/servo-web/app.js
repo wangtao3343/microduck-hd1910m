@@ -1,10 +1,13 @@
 // 跟 server.py 的 VERSION 一起改。连上后比对，不一致说明浏览器拿的是旧页面
-const PAGE_VERSION = "0.16.11";
+const PAGE_VERSION = "0.16.12";
 const $ = id => document.getElementById(id);
 const v = id => Number($(id).value);
 let ws, names = {}, present = [], ids = [], lastDump = null, gainRows = [], sendTimer = {}, lastSent = {};
 const rawPos = {}, goalPos = {};
 let dirs = {};   // 每颗 +1 / -1，来自服务端 directions.json，所有页面共用
+// 编号、中文名、分组、顺序全由服务端给（唯一真源 radxa/installation.json + servo-web/servo.json）。
+// 这个文件里不再写死任何 ID：角度那些表按关节名写，发指令前用 NAME2ID 换成当前编号。
+let CN = {}, ORDER = [], NAME2ID = {}, GROUPOF = {}, GROUPS = [], INSTALL = '';
 let isServoDemo = false;
 // The module can load after hello/the first frame: retain the latest state for it.
 const imuFeed = { enabled:false, connected:false, packet:null, revision:0 };
@@ -24,7 +27,9 @@ function connect() {
       $('ver').style.color = same ? '' : 'var(--bad)';
       $('ver').title = same ? '页面和服务版本一致' : '浏览器里是旧页面或服务没重启：先重启 server.py，再 Ctrl+F5';
       if (!same) hint(`页面 v${PAGE_VERSION} 跟服务 v${sv} 不一致：重启 server.py 后按 Ctrl+F5`);
-      dirs = {}; for (const [k, v] of Object.entries(m.dirs || {})) dirs[k] = v; names = m.names; ids = m.ids; present = m.present;  REGS = (m.regs || []).filter(r => r[3] === 'EEPROM' || r[3] === 'SRAM'); showPorts(m); fillLogCats(m.cats || []); build(); fillRegSelect(); (m.logs || []).forEach(pushLog); send({ op: 'poses' }); }
+      dirs = {}; for (const [k, v] of Object.entries(m.dirs || {})) dirs[k] = v; names = m.names; ids = m.ids; present = m.present;
+      applyJoints(m.joints);
+      REGS = (m.regs || []).filter(r => r[3] === 'EEPROM' || r[3] === 'SRAM'); showPorts(m); fillLogCats(m.cats || []); build(); fillRegSelect(); (m.logs || []).forEach(pushLog); send({ op: 'poses' }); }
     else if (m.type === 'imu') { if (imuFeed.enabled) { imuFeed.packet=m; announceImu(); } }
     else if (m.type === 'imu_config') { imuFeed.enabled = m.enabled === true; imuFeed.packet = null; announceImu(); showSimImu(m.sim_imu); }
     else if (m.type === 'ports') showPorts(m);
@@ -137,13 +142,39 @@ function fillLogCats(cats) {
 }
 
 // ---- 单颗操作的下拉 ----
-const CN = { 10: '左髋 yaw', 9: '左髋 roll', 8: '左髋 pitch', 7: '左膝', 6: '左踝', 12: '颈 pitch', 11: '头 pitch', 14: '头 yaw', 13: '头 roll', 15: '嘴',
-             5: '右髋 yaw', 4: '右髋 roll', 3: '右髋 pitch', 2: '右膝', 1: '右踝' };
-// 关节顺序（左腿 → 颈/头/嘴 → 右腿），跟 server.py 的 JOINT_NAMES 同一个顺序，也是本仓库
-// radxa/installation.json 里 joints 数组要求的顺序。编号只是编号，别按大小重排。
-const ORDER = [10, 9, 8, 7, 6, 12, 11, 14, 13, 15, 5, 4, 3, 2, 1];
-let REGS = [];   // [[地址, 名字, 字节数, 区]]，hello 里来，只留 EEPROM 和 SRAM（能写的）
+// 编号和中文名都从 hello 的 joints 里来（server.py 读 radxa/installation.json + servo.json）。
+// ORDER 是显示顺序（左腿 → 颈/头/嘴 → 右腿），也是 installation.json 里 joints 的顺序。编号只是编号，别按大小重排。
+function applyJoints(j) {
+  if (!j) return;
+  ORDER = j.order || [];
+  CN = {}; for (const [k, v] of Object.entries(j.cn || {})) CN[k] = v;
+  NAME2ID = {}; for (const [k, v] of Object.entries(j.names || {})) NAME2ID[v] = +k;
+  GROUPS = j.groups || [];
+  GROUPOF = {}; for (const g of GROUPS) for (const id of g.ids) GROUPOF[id] = g.key;
+  INSTALL = j.installation || '';
+  // 分组标题：编号变了标题跟着变（左腿 6–10 这类）
+  for (const g of GROUPS) {
+    const box = $('h_' + g.key); if (!box) continue;
+    const lo = Math.min(...g.ids), hi = Math.max(...g.ids);
+    box.textContent = g.ids.length > 1 ? `${g.label} ${lo}–${hi}` : `${g.label} ${lo}`;
+  }
+  const head = GROUPS.find(g => g.key === 'head');
+  if (head) { const b = $('idleBtn'); if (b) b.title = `头部随机小动作：歪头、摇头、点头、张嘴、左右看。以按下时的头部位置为中心，幅度不大，只动 ${head.label}`; }
+  const info = $('idSrc'); if (info) { info.textContent = INSTALL; info.title = `舵机编号来自 ${INSTALL}（robotd 也读它）`; }
+}
+// servo.json 的分组 → 页面上哪一块（g20 左腿 / g30 颈头嘴 / g10 右腿，认不出的进「其它 ID」）
+const GROUP_BOX = { left_leg: 'g20', head: 'g30', right_leg: 'g10' };
+// 角度表按关节名写 → 换成当前编号，只保留服务端在管的。编号换了这张表不用动。
+function toIds(rad) {
+  const out = {};
+  for (const [name, a] of Object.entries(rad)) {
+    const id = NAME2ID[name];
+    if (id !== undefined) out[id] = a;
+  }
+  return out;
+}
 function idLabel(id) { return `${id} · ${CN[id] || '非标准 ID'}${present.includes(id) ? '' : '（离线）'}`; }
+let REGS = [];   // [[地址, 名字, 字节数, 区]]，hello 里来，只留 EEPROM 和 SRAM（能写的）
 function fillSelect(sel, list, label, prefer) {
   const keep = sel.value; sel.innerHTML = '';
   list.forEach(id => { const o = document.createElement('option'); o.value = id; o.textContent = label(id); sel.appendChild(o); });
@@ -184,9 +215,8 @@ function build() {
   const all = [...new Set([...ids, ...present])].sort((a, b) => rank(a) - rank(b) || a - b);
   let other = false;
   all.forEach(id => {
-    // 按关节名分组，不按 ID 区间：本机编号是连续的 1–15，区间分不出左右腿和头颈
-    const nm = names[id] || '';
-    const g = nm.startsWith('left_') ? 'g20' : nm.startsWith('right_') ? 'g10' : nm ? 'g30' : (other = true, 'gx');
+    // 分组按 servo.json 的 group（编号变了、关节挪组，页面跟着变）；认不出的进「其它 ID」
+    const g = GROUP_BOX[GROUPOF[id]] || (other = true, 'gx');
     const on = present.includes(id);
     const d = document.createElement('div');
     d.className = 'servo' + (on ? '' : ' off'); d.id = 's' + id;
@@ -262,18 +292,24 @@ function calibRefText() {
 // 用户自己动过基准下拉没有。没动过就一直默认「官方折叠」：零位 2048 要把鸭子悬空扶直，
 // 15 颗同时摆准不现实，而折叠能靠零件顶住自定位。动过就尊重他的选择，刷新姿态列表时不再改回去。
 let calibRefTouched = false;
-// 这一颗该摆成什么样。官方姿势按关节类型查表（CN 里的「右髋 pitch」去掉左右就是 key）；
-// 存的姿态定不住哪颗是姿态自己的事，只能给一句话。
+// 这一颗该摆成什么样。官方姿势按关节名查表；存的姿态定不住哪颗是姿态自己的事，只能给一句话。
+// 按关节名写，编号换了不用动。
 const CALIB_HOW = {
-  '@official:FOLD': { 踝: '折到脚板跟小腿成直角', 膝: '折到踝刚贴上大腿舵机就停，别再往里顶',
-    髋pitch: '用直角尺把大腿摆到跟躯干垂直', 髋roll: '不外张、不往里夹', 髋yaw: '不外撇、不内扣',
-    '颈pitch': '脖子竖直', '头pitch': '平视朝正前', '头roll': '头不歪', '头yaw': '头朝正前', 嘴: '嘴闭上' },
-  '': { 踝: '腿伸直，脚板垂直', 膝: '腿伸直，别弯', 髋pitch: '腿伸直，大腿跟躯干成一条线',
-    髋roll: '不外张、不往里夹', 髋yaw: '不外撇、不内扣',
-    '颈pitch': '脖子竖直', '头pitch': '平视朝正前', '头roll': '头不歪', '头yaw': '头朝正前', 嘴: '嘴闭上' },
+  '@official:FOLD': { left_ankle: '折到脚板跟小腿成直角', right_ankle: '折到脚板跟小腿成直角',
+    left_knee: '折到踝刚贴上大腿舵机就停，别再往里顶', right_knee: '折到踝刚贴上大腿舵机就停，别再往里顶',
+    left_hip_pitch: '用直角尺把大腿摆到跟躯干垂直', right_hip_pitch: '用直角尺把大腿摆到跟躯干垂直',
+    left_hip_roll: '不外张、不往里夹', right_hip_roll: '不外张、不往里夹',
+    left_hip_yaw: '不外撇、不内扣', right_hip_yaw: '不外撇、不内扣',
+    neck_pitch: '脖子竖直', head_pitch: '平视朝正前', head_roll: '头不歪', head_yaw: '头朝正前', mouth: '嘴闭上' },
+  '': { left_ankle: '腿伸直，脚板垂直', right_ankle: '腿伸直，脚板垂直',
+    left_knee: '腿伸直，别弯', right_knee: '腿伸直，别弯',
+    left_hip_pitch: '腿伸直，大腿跟躯干成一条线', right_hip_pitch: '腿伸直，大腿跟躯干成一条线',
+    left_hip_roll: '不外张、不往里夹', right_hip_roll: '不外张、不往里夹',
+    left_hip_yaw: '不外撇、不内扣', right_hip_yaw: '不外撇、不内扣',
+    neck_pitch: '脖子竖直', head_pitch: '平视朝正前', head_roll: '头不歪', head_yaw: '头朝正前', mouth: '嘴闭上' },
 };
 function calibHow(ref, id) {
-  if (!ref || ref === '@official:FOLD') return (CALIB_HOW[ref || ''] || {})[(CN[id] || '').replace(/^[左右]/, '').replace(' ', '')] || '';
+  if (!ref || ref === '@official:FOLD') return (CALIB_HOW[ref || ''] || {})[names[id]] || '';
   const p = posesCache.find(q => q.file === ref);
   return p ? `摆成「${p.name}」里的样子，这一颗得定得住` : '';
 }
@@ -363,9 +399,12 @@ function showTorqueResult(m) {
 }
 function torqueAll(on) { send({ op: 'torque', on }); present.forEach(id => { const t = $('t' + id); if (t) t.checked = !!on; }); }
 function syncSliders() { present.forEach(id => { const p = rawPos[id]; if (p !== undefined) { const c = Math.max(0, Math.min(4095, p)); $('r' + id).value = c; goalPos[id] = c; } }); }
-// 官方 model.rs DEFAULT_POSITION，弧度，零位 = 笔直站
-const DEFAULT_POSITION = { 10: 0, 9: -0.0873, 8: -0.4579, 7: -0.0049, 6: 0.4530, 12: 0.3491, 11: 0.3491, 14: 0, 13: 0, 15: 0,
-                           5: 0, 4: 0.0873, 3: 0.4579, 2: 0.0049, 1: -0.4530 };
+// 官方 model.rs DEFAULT_POSITION，弧度，零位 = 笔直站。按关节名写，编号由 applyJoints 换。
+const DEFAULT_POSITION = {
+  left_hip_yaw: 0, left_hip_roll: -0.0873, left_hip_pitch: -0.4579, left_knee: -0.0049, left_ankle: 0.4530,
+  neck_pitch: 0.3491, head_pitch: 0.3491, head_yaw: 0, head_roll: 0, mouth: 0,
+  right_hip_yaw: 0, right_hip_roll: 0.0873, right_hip_pitch: 0.4579, right_knee: 0.0049, right_ankle: -0.4530,
+};
 // 按钮文案跟存下来的姿态名不总是一模一样：按钮写「站姿」
 // 只按 p.name.includes(key) 找的话这两种都找不到 —— 「站姿」看着能用，其实是掉进了下面官方 DEFAULT_POSITION 的兜底，
 // 发的一直是官方默认值、不是你调好的那个姿态。这里改成两边互相包含也算命中；
@@ -381,26 +420,33 @@ function standPose() {
   const p = findPose('站姿');
   if (p) { sendPose(posesCache.indexOf(p)); return; }
   if (!confirm('poses/ 里没有存的「站姿」，发官方 DEFAULT_POSITION？髋 pitch ±26°、踝 ∓26°、颈/头 +20°，按每颗的 ± 换算。第一次托着试')) return;
-  const goals = {};
-  present.forEach(id => { if (DEFAULT_POSITION[id] === undefined) return; goals[id] = Math.round(2048 + DEFAULT_POSITION[id] * 4096 / (2 * Math.PI) * (dirs[id] || 1)); });
+  const rad = toIds(DEFAULT_POSITION), goals = {};
+  present.forEach(id => { if (rad[id] === undefined) return; goals[id] = Math.round(2048 + rad[id] * 4096 / (2 * Math.PI) * (dirs[id] || 1)); });
   const sec = Number($('rampSec').value) || 0; addLog(`站姿（${sec} s）→ ` + JSON.stringify(goals), '运动'); rampTo(goals, sec);
 }
 // 官方姿势：microduck_rl src/mjlab_microduck/robot/microduck/scene.xml 的 keyframe（d424a0c），弧度、模型约定。
-// 嘴不在官方模型里：只有零位带嘴（2048）
+// 按关节名写，编号换了这个表不用动。嘴不在官方模型里：只有零位带嘴（2048）
 const OFFICIAL_POSES = {
-  INIT:  { label: '零位', rad: { 10: 0, 9: 0, 8: 0, 7: 0, 6: 0, 12: 0, 11: 0, 14: 0, 13: 0, 15: 0, 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 } },
+  INIT:  { label: '零位', rad: Object.fromEntries(Object.keys(DEFAULT_POSITION).map(k => [k, 0])) },
   STAND: { label: '站', rad: DEFAULT_POSITION },
-  SIT:   { label: '坐', rad: { 10: 0, 9: 0, 8: -0.5236, 7: 1.0472, 6: 0, 12: 0.5, 11: 1.6, 14: 0, 13: 0, 5: 0, 4: 0, 3: 0.5236, 2: -1.0472, 1: 0 } },
-  FOLD:  { label: '折叠', rad: { 10: 0, 9: 0, 8: 1.57, 7: 1.57, 6: 0, 12: 1, 11: 1, 14: 0, 13: 0, 5: 0, 4: 0, 3: -1.57, 2: -1.57, 1: 0 } },
+  SIT:   { label: '坐', rad: { left_hip_yaw: 0, left_hip_roll: 0, left_hip_pitch: -0.5236, left_knee: 1.0472, left_ankle: 0,
+                               neck_pitch: 0.5, head_pitch: 1.6, head_yaw: 0, head_roll: 0,
+                               right_hip_yaw: 0, right_hip_roll: 0, right_hip_pitch: 0.5236, right_knee: -1.0472, right_ankle: 0 } },
+  FOLD:  { label: '折叠', rad: { left_hip_yaw: 0, left_hip_roll: 0, left_hip_pitch: 1.57, left_knee: 1.57, left_ankle: 0,
+                                 neck_pitch: 1, head_pitch: 1, head_yaw: 0, head_roll: 0,
+                                 right_hip_yaw: 0, right_hip_roll: 0, right_hip_pitch: -1.57, right_knee: -1.57, right_ankle: 0 } },
 };
 // 校准用折叠：跟服务端 FOLD_CALIB 同一份，腿按官方折叠，头颈摆正、嘴闭上。只用来叠加，没有按钮发它
-OFFICIAL_POSES.FOLD_CALIB = { label: '校准用折叠（头颈摆正）', rad: { ...OFFICIAL_POSES.FOLD.rad, 12: 0, 11: 0, 15: 0 } };
+OFFICIAL_POSES.FOLD_CALIB = { label: '校准用折叠（头颈摆正）', rad: { ...OFFICIAL_POSES.FOLD.rad, neck_pitch: 0, head_pitch: 0, mouth: 0 } };
 // 精确网格求交（官方 XL330 几何，tools/fold_contact/fold_contact.py）：髋 ±90°、踝 0° 时膝折到 89.6° 踝就碰上大腿舵机，
 // FOLD 的 90° 会顶进去 0.36°。真机发折叠时膝只折 88°，不让舵机顶着零件使劲。3D 叠加仍显示官方原值
 const FOLD_KNEE_SEND = 88 * Math.PI / 180;
 function officialGoals(key) {
-  const rad = { ...OFFICIAL_POSES[key].rad };
-  if (key === 'FOLD') { rad[7] = FOLD_KNEE_SEND; rad[2] = -FOLD_KNEE_SEND; }
+  const rad = toIds(OFFICIAL_POSES[key].rad);
+  if (key === 'FOLD') {
+    if (rad[NAME2ID.left_knee] !== undefined) rad[NAME2ID.left_knee] = FOLD_KNEE_SEND;
+    if (rad[NAME2ID.right_knee] !== undefined) rad[NAME2ID.right_knee] = -FOLD_KNEE_SEND;
+  }
   const goals = {};
   present.forEach(id => { if (rad[id] !== undefined) goals[id] = Math.round(2048 + rad[id] * 4096 / (2 * Math.PI) * (dirs[id] || 1)); });
   return goals;
@@ -424,8 +470,8 @@ function renderGhostTable() {
   const key = $('ghostPose').value, box = $('ghostTbl');
   if (!key) { box.innerHTML = ''; return; }
   const rad = OFFICIAL_POSES[key].rad;
-  const rows = ORDER.filter(id => rad[id] !== undefined).map(id => {
-    const off = rad[id] * 180 / Math.PI, raw = rawPos[id];
+  const rows = ORDER.filter(id => rad[names[id]] !== undefined).map(id => {
+    const off = rad[names[id]] * 180 / Math.PI, raw = rawPos[id];
     if (raw === undefined) return `<tr><td>${id} ${CN[id]}</td><td class="n">${off.toFixed(1)}</td><td class="n muted">—</td><td class="n muted">—</td></tr>`;
     const act = (dirs[id] || 1) * (raw - 2048) * 360 / 4096, diff = act - off;
     const col = Math.abs(diff) > 5 ? 'var(--bad)' : Math.abs(diff) > 2 ? 'var(--warn)' : 'var(--acc)';
@@ -507,8 +553,8 @@ function showGains(m) {
 }
 // robotd.toml 的 [bus.feetech] directions：关节顺序是左腿 6–10、颈头嘴 11–15、右腿 1–5
 function copyRobotdDirs() {
-  const order = [10, 9, 8, 7, 6, 12, 11, 14, 13, 15, 5, 4, 3, 2, 1];
-  const line = 'directions = [' + order.map(id => (dirs[id] || 1) < 0 ? -1 : 1).join(', ') + ']';
+  // 顺序用服务端给的 ORDER（就是 installation.json 里 joints 的顺序），换编号不用改这里
+  const line = 'directions = [' + ORDER.map(id => (dirs[id] || 1) < 0 ? -1 : 1).join(', ') + ']';
   navigator.clipboard.writeText(line).then(() => addLog('已复制：' + line), () => addLog(line));
 }
 let posesCache = [], rampTimer = null, seqAbort = false;
@@ -631,28 +677,32 @@ const pick = arr => arr[Math.floor(Math.random() * arr.length)];
 const wait = ms => new Promise(r => setTimeout(r, ms));
 function moveHead(deltaDeg, sec, acc) {
   const goals = {};
-  for (const [id, deg] of Object.entries(deltaDeg)) {
-    if (!present.includes(+id) || !idleCenter || idleCenter[id] === undefined) continue;
+  for (const [name, deg] of Object.entries(deltaDeg)) {
+    const id = NAME2ID[name];
+    if (id === undefined || !present.includes(id) || !idleCenter || idleCenter[id] === undefined) continue;
     const raw = Math.round(idleCenter[id] + deg * D * (dirs[id] || 1));
     goals[id] = Math.max(0, Math.min(4095, raw)); $('r' + id).value = goals[id]; goalPos[id] = goals[id]; $('p' + id).textContent = goals[id];
   }
   if (Object.keys(goals).length) send({ op: 'goals_profile', goals, seconds: sec, acc: acc || 35 });
   return wait(sec * 1000 + 60);   // 只比走的时间多等 60 ms，下一条紧接着发
 }
-// 每个动作：[相对中心的度数, 秒]。14 yaw、13 roll、11 头 pitch、12 颈 pitch、15 嘴（正 = 张）。{} = 停住不动
+// 每个动作：[相对中心的度数, 秒]。head_yaw 左右、head_roll 歪、head_pitch 点头、neck_pitch 颈、mouth 嘴（正 = 张）。
+// 按关节名写，编号换了不用动。{} = 停住不动
 const GESTURES = [
-  { w: 3, steps: () => { const s = pick([-1, 1]); return [[{ 13: 14 * s, 14: 8 * s }, 0.5], [{}, rnd(0.6, 1.4)], [{ 13: 0, 14: 0 }, 0.6]]; } },            // 歪头
-  { w: 3, steps: () => { const s = pick([-1, 1]); return [[{ 14: 30 * s, 13: -5 * s, 11: 4 }, 0.6], [{}, rnd(0.8, 1.8)], [{ 14: 0, 13: 0, 11: 0 }, 0.7]]; } }, // 看一边
-  { w: 2, steps: () => [[{ 14: -20 }, 0.3], [{ 14: 20 }, 0.38], [{ 14: -12 }, 0.32], [{ 14: 0 }, 0.35]] },                                            // 摇头
-  { w: 2, steps: () => [[{ 11: 12 }, 0.3], [{ 11: -7 }, 0.34], [{ 11: 6 }, 0.3], [{ 11: 0 }, 0.35]] },                                               // 点头
-  { w: 2, steps: () => [[{ 15: 16 }, 0.22], [{ 15: 0 }, 0.26], [{ 15: 13 }, 0.22], [{ 15: 0 }, 0.28]] },                                             // 嘎嘎两下
-  { w: 2, steps: () => { const s = pick([-1, 1]); return [[{ 13: 12 * s, 11: -8, 15: 9 }, 0.55], [{}, rnd(0.5, 1.0)], [{ 15: 0 }, 0.25], [{ 13: 0, 11: 0 }, 0.6]]; } }, // 好奇
-  { w: 2, steps: () => { const s = pick([-1, 1]); return [[{ 14: 18 * s, 11: 6 }, 0.45], [{ 14: -18 * s, 11: 6 }, 0.7], [{ 14: 0, 11: 0 }, 0.5]]; } },   // 扫视
-  { w: 1, steps: () => [[{ 13: 7, 14: 6 }, 0.18], [{ 13: -7, 14: -6 }, 0.2], [{ 13: 0, 14: 0 }, 0.25]] },                                            // 抖一下
+  { w: 3, steps: () => { const s = pick([-1, 1]); return [[{ head_roll: 14 * s, head_yaw: 8 * s }, 0.5], [{}, rnd(0.6, 1.4)], [{ head_roll: 0, head_yaw: 0 }, 0.6]]; } },            // 歪头
+  { w: 3, steps: () => { const s = pick([-1, 1]); return [[{ head_yaw: 30 * s, head_roll: -5 * s, head_pitch: 4 }, 0.6], [{}, rnd(0.8, 1.8)], [{ head_yaw: 0, head_roll: 0, head_pitch: 0 }, 0.7]]; } }, // 看一边
+  { w: 2, steps: () => [[{ head_yaw: -20 }, 0.3], [{ head_yaw: 20 }, 0.38], [{ head_yaw: -12 }, 0.32], [{ head_yaw: 0 }, 0.35]] },                                            // 摇头
+  { w: 2, steps: () => [[{ head_pitch: 12 }, 0.3], [{ head_pitch: -7 }, 0.34], [{ head_pitch: 6 }, 0.3], [{ head_pitch: 0 }, 0.35]] },                                     // 点头
+  { w: 2, steps: () => [[{ mouth: 16 }, 0.22], [{ mouth: 0 }, 0.26], [{ mouth: 13 }, 0.22], [{ mouth: 0 }, 0.28]] },                                                       // 嘎嘎两下
+  { w: 2, steps: () => { const s = pick([-1, 1]); return [[{ head_roll: 12 * s, head_pitch: -8, mouth: 9 }, 0.55], [{}, rnd(0.5, 1.0)], [{ mouth: 0 }, 0.25], [{ head_roll: 0, head_pitch: 0 }, 0.6]]; } }, // 好奇
+  { w: 2, steps: () => { const s = pick([-1, 1]); return [[{ head_yaw: 18 * s, head_pitch: 6 }, 0.45], [{ head_yaw: -18 * s, head_pitch: 6 }, 0.7], [{ head_yaw: 0, head_pitch: 0 }, 0.5]]; } },   // 扫视
+  { w: 1, steps: () => [[{ head_roll: 7, head_yaw: 6 }, 0.18], [{ head_roll: -7, head_yaw: -6 }, 0.2], [{ head_roll: 0, head_yaw: 0 }, 0.25]] },                             // 抖一下
 ];
 async function toggleIdle() {
   if (idleRunning) { idleRunning = false; $('idleBtn').textContent = '🦆 灵动'; return; }
-  const headIds = [12, 11, 14, 13, 15].filter(id => present.includes(id));
+  // 灵动只动这几颗，按关节名（编号由 NAME2ID 换）
+  const HEAD_NAMES = ['neck_pitch', 'head_pitch', 'head_yaw', 'head_roll', 'mouth'];
+  const headIds = HEAD_NAMES.map(n => NAME2ID[n]).filter(id => id !== undefined && present.includes(id));
   if (headIds.length < 3) { hint('头部舵机不在线'); return; }
   if (!headIds.every(id => $('t' + id).checked) && !confirm('头部扭矩没全开，要先开吗？')) return;
   send({ op: 'torque', on: 1, ids: headIds }); headIds.forEach(id => { $('t' + id).checked = true; });
@@ -668,7 +718,7 @@ async function toggleIdle() {
     }
     if (idleRunning) await wait(rnd(300, 1500));
   }
-  await moveHead({ 12: 0, 11: 0, 14: 0, 13: 0, 15: 0 }, 0.7);
+  await moveHead({ neck_pitch: 0, head_pitch: 0, head_yaw: 0, head_roll: 0, mouth: 0 }, 0.7);
   send({ op: 'release', ids: Object.keys(idleCenter).map(Number) });
   addLog('灵动结束，头回中心', '运动'); idleCenter = null;
 }

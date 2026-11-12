@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """舵机体检：一条命令读出每颗舵机的保护设置和当前状态，存成报告。**只读，不写舵机任何寄存器。**
 
-  python servo_report.py --port COM5                 # 默认 15 颗：1-15
+  python servo_report.py --port COM5                 # 默认 installation.json 里的全部关节
   python servo_report.py --port COM5 --ids 7         # 总线上只接 7 号时
   python servo_report.py --port COM5 --scan-all      # 不知道 ID（新舵机出厂是 1）：扫 0–253
 
@@ -16,12 +16,13 @@ import sys
 import time
 
 import feetech
+import joints
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_IDS = "1-15"
-NAMES = {10: "左髋 yaw", 9: "左髋 roll", 8: "左髋 pitch", 7: "左膝", 6: "左踝",
-         12: "颈 pitch", 11: "头 pitch", 14: "头 yaw", 13: "头 roll", 15: "嘴",
-         5: "右髋 yaw", 4: "右髋 roll", 3: "右髋 pitch", 2: "右膝", 1: "右踝"}
+# 编号和中文名都从 radxa/installation.json + servo.json 来，这个文件不再写死 ID
+_J = joints.load()
+DEFAULT_IDS = ",".join(str(i) for i in sorted(_J.ids))
+NAMES = _J.cn_by_id
 # 卸载条件（19）/ 状态位（65）每一位的意思，两个寄存器同一套定义
 BITS = {1: "电压", 2: "磁编码", 4: "过热", 8: "过流", 32: "过载"}
 MUST = (4, 8, 1)          # 调试记录第 5 步：过热出厂开着，过流、过压要自己开

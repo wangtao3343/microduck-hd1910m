@@ -16,13 +16,11 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 
-# 本机（microduck-hd1910m）的舵机编号，权威来源是仓库根的 radxa/installation.json。
-# 改了这里要重新跑一遍生成 model/，否则 model.json 里的 joint.id 跟滑块对不上。
-JOINT_IDS = {
-    "left_hip_yaw": 10, "left_hip_roll": 9, "left_hip_pitch": 8, "left_knee": 7, "left_ankle": 6,
-    "neck_pitch": 12, "head_pitch": 11, "head_yaw": 14, "head_roll": 13, "mouth": 15,
-    "right_hip_yaw": 5, "right_hip_roll": 4, "right_hip_pitch": 3, "right_knee": 2, "right_ankle": 1,
-}
+# 舵机编号的唯一真源是仓库根的 radxa/installation.json（robotd 读的也是它），这里只转一手。
+# 网页里的 3D 是按关节名对应实时读数的，改了编号不用重新生成模型；id 只用来标「这个关节有舵机」。
+import joints
+
+JOINT_IDS = joints.load().id_by_name
 # 壳子里看不见的东西，不进网页
 SKIP_DEFAULT = "pcb__raspberry_pi_zero_2_w,elec_rpi_robot_hat_pcb,seeed_bearing__configuration__22x16x4,seeed_bearing__configuration_default,speaker,m12_lens_holder,banana_pcb_locker,upper_leg_rigidity_plate,motor_support,power_support"
 

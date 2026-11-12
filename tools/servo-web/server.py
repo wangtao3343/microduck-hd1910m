@@ -32,21 +32,39 @@ from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocketDisconnect
 
 import feetech
+import joints as joint_map
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # 调试台版本。改了前端或后端就加一：app.js 里的 PAGE_VERSION 要跟这里一样，
 # 页面连上后会比对，不一样就提示"页面是旧的，Ctrl+F5"。改动记在 README 的「版本」一节。
-VERSION = "0.16.11"
-# 本机（microduck-hd1910m）的舵机编号：右腿 1–5、左腿 6–10、头颈 11–15。
-# 映射的权威来源是仓库根的 radxa/installation.json（robotd 读的就是它）；
-# 关节顺序跟原项目一样是「左腿 → 颈/头/嘴 → 右腿」，只有编号不同。
-DEFAULT_IDS = "1-15"
-JOINT_NAMES = {
-    10: "left_hip_yaw", 9: "left_hip_roll", 8: "left_hip_pitch", 7: "left_knee", 6: "left_ankle",
-    12: "neck_pitch", 11: "head_pitch", 14: "head_yaw", 13: "head_roll", 15: "mouth",
-    5: "right_hip_yaw", 4: "right_hip_roll", 3: "right_hip_pitch", 2: "right_knee", 1: "right_ankle",
-}
+VERSION = "0.16.12"
+# 舵机编号（哪颗舵机是哪个关节）只在 radxa/installation.json 里写一次 —— robotd 读的也是它。
+# 这个文件不再写死任何 ID：中文名、分组、显示顺序在 servo-web/servo.json，
+# 两边合起来就是下面这张表。换编号只改 installation.json，网页 / 3D / 姿态 / 校准全跟着变。
+JOINTS = joint_map.load()
+JOINT_NAMES = JOINTS.name_by_id
+IDS = list(JOINTS.order)
+
+
+def ids_text(ids):
+    """[1..15] → "1-15"；不连续的用逗号分开。只用来显示和当 --ids 的默认值。"""
+    ids = sorted(set(ids))
+    if not ids:
+        return ""
+    parts, start, prev = [], ids[0], ids[0]
+    for i in ids[1:]:
+        if i == prev + 1:
+            prev = i
+            continue
+        parts.append(f"{start}-{prev}" if prev != start else str(start))
+        start = prev = i
+    parts.append(f"{start}-{prev}" if prev != start else str(start))
+    return ",".join(parts)
+
+
+# 默认管全部编号；1–15 时不连续的话就列出来（比如 21,22,30）
+DEFAULT_IDS = ids_text(JOINTS.ids)
 
 
 def parse_ids(text):
@@ -450,16 +468,27 @@ DIRS_FILE = os.path.join(HERE, "directions.json")
 
 
 def load_dirs():
-    """每颗舵机的方向 +1 / -1。文件里没写的按 +1。"""
+    """每颗舵机的方向 +1 / -1。默认取 installation.json 里每颗的 direction（跟 robotd 一致），
+    directions.json 只当覆盖 —— 页面上按 ± 改的就是它。
+    文件里按关节名存（"left_knee": -1），换编号不会串到别的舵机上；老的按数字写的照样认。"""
+    out = dict(JOINTS.dir_by_id)
     try:
         with open(DIRS_FILE, encoding="utf-8") as f:
             raw = json.load(f)
-        return {int(k): (-1 if v == -1 else 1) for k, v in raw.items() if not k.startswith("_")}
     except FileNotFoundError:
-        return {}
+        return out
     except Exception as e:
-        log(f"directions.json 读不了，全部按 +1：{e}", "方向", "warn")
-        return {}
+        log(f"directions.json 读不了，按 installation.json 的方向：{e}", "方向", "warn")
+        return out
+    for k, v in raw.items():
+        if k.startswith("_"):
+            continue
+        name = JOINTS.name_of(int(k)) if k.lstrip("-").isdigit() else k
+        sid = JOINTS.id_of(name) if name else None
+        if sid is None:
+            continue
+        out[sid] = -1 if v == -1 else 1
+    return out
 
 
 def save_dirs(dirs):
@@ -470,8 +499,8 @@ def save_dirs(dirs):
     except Exception:
         pass
     out = {"_note": note} if note else {}
-    for i in IDS:
-        out[str(i)] = dirs.get(i, 1)
+    for it in JOINTS.items:
+        out[it["name"]] = dirs.get(it["id"], it["direction"])
     with open(DIRS_FILE, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=1)
 
@@ -822,12 +851,15 @@ def save_json_atomic(path, obj):
 
 
 # 官方姿势：microduck_rl src/mjlab_microduck/robot/microduck/scene.xml 的 keyframe（d424a0c），弧度、模型约定。
-# 跟 index.html 的 OFFICIAL_POSES 是同一份。只有「折叠」能当校准基准：鸭子折好能自己趴住，膝靠零件顶住
-OFFICIAL_FOLD = {10: 0, 9: 0, 8: 1.57, 7: 1.57, 6: 0, 12: 1, 11: 1, 14: 0, 13: 0,
-                 5: 0, 4: 0, 3: -1.57, 2: -1.57, 1: 0}
+# 跟 app.js 的 OFFICIAL_POSES 是同一份。按关节名写 —— 编号换了这里不用动。只有「折叠」能当校准基准：
+# 鸭子折好能自己趴住，膝靠零件顶住
+OFFICIAL_FOLD = {"left_hip_yaw": 0, "left_hip_roll": 0, "left_hip_pitch": 1.57, "left_knee": 1.57,
+                 "left_ankle": 0, "neck_pitch": 1, "head_pitch": 1, "head_yaw": 0, "head_roll": 0,
+                 "right_hip_yaw": 0, "right_hip_roll": 0, "right_hip_pitch": -1.57,
+                 "right_knee": -1.57, "right_ankle": 0}
 # 校准用的折叠：腿按官方 FOLD，头颈摆正（颈、头 pitch 0°）、嘴闭上。官方 FOLD 的颈 / 头 57° 不是接触点
 # （腿折好时颈要转到 66.6° 才碰上零件，fold_contact 算的），靠眼睛摆不准；脖子竖直、头平视好摆得多。零点照样是官方 2048
-FOLD_CALIB = {**OFFICIAL_FOLD, 12: 0, 11: 0, 15: 0}
+FOLD_CALIB = {**OFFICIAL_FOLD, "neck_pitch": 0, "head_pitch": 0, "mouth": 0}
 OFFICIAL_REFS = {"@official:FOLD": ("官方折叠（头颈摆正）", FOLD_CALIB)}
 
 
@@ -835,7 +867,12 @@ def official_targets(ref):
     """官方基准的目标读数：2048 + 角度 × 4096/2π × ±。± 用 directions.json，跟 3D、姿态发送一致。"""
     label, rad = OFFICIAL_REFS[ref]
     dirs = load_dirs()
-    return label, {i: int(round(2048 + a * 4096 / (2 * math.pi) * dirs.get(i, 1))) for i, a in rad.items()}
+    out = {}
+    for name, a in rad.items():
+        sid = JOINTS.id_of(name)
+        if sid is not None:
+            out[sid] = int(round(2048 + a * 4096 / (2 * math.pi) * dirs.get(sid, 1)))
+    return label, out
 
 
 def read_pose_file(fn):
@@ -843,6 +880,18 @@ def read_pose_file(fn):
         raise ValueError(f"不认识的姿态文件 {fn!r}")
     with open(os.path.join(POSES_DIR, fn), encoding="utf-8") as f:
         return json.load(f)
+
+
+def pose_targets(pose):
+    """姿态文件 → {ID: 读数}。有 joint 字段就按关节名查现在的编号（换编号后老姿态照样能用）；
+    老文件只有 id 的只好直接用 id。"""
+    out = {}
+    for r in pose.get("rows", []):
+        sid = JOINTS.id_of(r.get("joint")) if r.get("joint") else None
+        if sid is None:
+            sid = int(r["id"])
+        out[sid] = int(r["pos"])
+    return out
 
 
 def calib_targets(ref):
@@ -853,8 +902,7 @@ def calib_targets(ref):
         label, targets = official_targets(ref)
         return label, targets, True
     pose = read_pose_file(ref)
-    return (f"姿态「{pose.get('name', ref)}」（{ref}）",
-            {int(r["id"]): int(r["pos"]) for r in pose.get("rows", [])}, False)
+    return (f"姿态「{pose.get('name', ref)}」（{ref}）", pose_targets(pose), False)
 
 
 def calib_plan(ids, ref=None):
@@ -1058,7 +1106,7 @@ def list_poses():
                     with open(os.path.join(POSES_DIR, fn), encoding="utf-8") as f:
                         p = json.load(f)
                     out.append({"file": fn, "name": p.get("name", fn[:-5]), "time": p.get("time", ""), "note": p.get("note", ""),
-                                "goals": {r["id"]: r["pos"] for r in p.get("rows", [])},
+                                "goals": pose_targets(p),
                                 "steps": p.get("steps")})
                 except Exception as e:
                     log(f"姿态文件 {fn} 读不了：{type(e).__name__}: {e}", "姿态", "warn")
@@ -1412,6 +1460,9 @@ def handle(cmd):
     elif op == "set_id":
         ok = BUS.set_id(int(cmd["old"]), int(cmd["new"]))
         log(f"改 ID {cmd['old']} → {cmd['new']}：" + ("新 ID ping 得通" if ok else "新 ID ping 不通"), "寄存器", "info" if ok else "error")
+        if ok:
+            log(f"这颗要是换了号，记得改 {JOINTS.source} 里对应关节的 id，否则网页和 robotd 还按老编号认它"
+                f"（改完重启本服务）", "寄存器", "warn")
         return {"type": "scan", "present": do_scan(IDS)}
     elif op == "timing":
         return {"type": "timing", **do_timing(int(cmd.get("n", 200)))}
@@ -1555,6 +1606,7 @@ QUIET = {"goal", "goals", "goals_stream", "stream_end", "poses", "log", "release
 async def ws_endpoint(ws):
     await ws.accept()
     await ws.send_text(json.dumps({"type": "hello", "ids": IDS, "present": PRESENT, "names": JOINT_NAMES,
+                                   "joints": JOINTS.payload(),
                                    "fake": is_fake(), "logs": LOG[-150:], "cats": LOG_CATS, "dirs": load_dirs(),
                                    "port": PORT, "ports": list_ports(),
                                    "regs": [[a, *feetech.REGISTERS[a]] for a in sorted(feetech.REGISTERS)],
@@ -1729,7 +1781,8 @@ def parse_args(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", help="串口，如 COM5 / /dev/ttyUSB0 / /dev/ttyS2")
     ap.add_argument("--baud", type=int, default=1_000_000)
-    ap.add_argument("--ids", default=DEFAULT_IDS, help="要管的 ID，如 1-15")
+    ap.add_argument("--ids", help=f"要管的 ID，如 1-15（默认为 installation.json 里的全部：{DEFAULT_IDS or '—'}）")
+    ap.add_argument("--installation", help="舵机编号文件；默认仓库根的 radxa/installation.json")
     ap.add_argument("--fake", action="store_true",
                     help="挂 15 颗虚拟舵机，不动真硬件。只有明写这个才用假总线；串口打不开不会自动退到它")
     ap.add_argument("--host", default="0.0.0.0")
@@ -1804,15 +1857,23 @@ def create_imu_service(args):
 
 
 def main(argv=None):
-    global BUS, IDS, PRESENT, BAUD, IMU_SERVICE
+    global BUS, IDS, PRESENT, BAUD, IMU_SERVICE, JOINTS, JOINT_NAMES, DEFAULT_IDS
     a = parse_args(argv)
+    if a.installation:
+        JOINTS = joint_map.load(a.installation)
+        JOINT_NAMES = JOINTS.name_by_id
+        DEFAULT_IDS = ids_text(JOINTS.ids)
     try:
         IMU_SERVICE = create_imu_service(a)
     except (ValueError, RuntimeError, OSError) as exc:
         raise SystemExit(f"IMU 配置错误：{exc}") from exc
-    IDS = parse_ids(a.ids)
+    IDS = parse_ids(a.ids or DEFAULT_IDS)
     BAUD = a.baud
     log(f"舵机调试台 v{VERSION} 启动，日志 logs/{os.path.basename(log_path())}", "系统")
+    log(f"舵机编号来自 {JOINTS.source}：{len(JOINTS.items)} 颗，管的 ID {ids_text(IDS)}", "系统")
+    if JOINTS.missing_from_config:
+        log(f"这些关节在 servo.json 里没写中文名/分组，按英文名显示：{'、'.join(JOINTS.missing_from_config)}",
+            "系统", "warn")
     if a.fake:
         use_fake_bus("--fake")
     elif not a.port:

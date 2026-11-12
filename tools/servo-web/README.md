@@ -57,7 +57,7 @@ python server.py --fake                      # 没舵机：模拟模式，舵机
 
 串口打不开（USB 没插、口号变了、被 `robotd` 占着）**直接报错退出，不会自己换成假总线** —— 那会让页面显示 15 颗并不存在的「在线」舵机，看着像接上了、其实一条指令都没发出去。原因（含现在能看到的串口列表）写进 `logs/` 和 stderr，插好 USB 重新 `./start.sh` 就行。假总线只在**明写 `--fake`** 时才用；服务起来之后在顶栏换串口点「连接」仍然可以，不用重启。
 
-浏览器开 `http://127.0.0.1:8080`；在板子上跑就用板子 IP，手机也能开。默认管的 ID 是 `1-15`（本机编号：右腿 1–5、左腿 6–10、头颈 11–15，来源 [radxa/installation.json](../../radxa/installation.json)），别的用 `--ids`。3D 模型的文件在 `model/`，已经生成好；要重新生成：
+浏览器开 `http://127.0.0.1:8080`；在板子上跑就用板子 IP，手机也能开。编号和中文名来自 [radxa/installation.json](../../radxa/installation.json) + 本目录的 `servo.json`（见下面「舵机编号」一节），默认管全部 15 颗，别的最好别用 `--ids` 缩小范围除非你只接了几颗。3D 模型的文件在 `model/`，已经生成好；要重新生成：
 
 ```bash
 python build_model.py --src <microduck_rl>/src/mjlab_microduck/robot/microduck
@@ -163,6 +163,18 @@ Node.js 只用于前端数学测试，正常使用调试台不需要。固件主
 
 装了 ROS 的机器上，`PYTHONPATH` 里的 `ament_*` / `launch_testing` pytest 插件会在收集阶段报错（缺 `lark`），跑之前清一下：`PYTHONPATH= python -m pytest -q`。
 
+## 舵机编号
+
+**ID 只写在一个地方：[radxa/installation.json](../../radxa/installation.json)。** `robotd` 读的是它，调试台的网页、3D、姿态、校准、体检也都跟着它走 —— 所以不会出现「网页上 7 号是膝盖、策略里 7 号是别的东西」。
+
+换编号的步骤：改 `installation.json` 里某个关节的 `id`（或用页面「校准」页的改 ID 功能把舵机自己改号，再同步这个文件）→ 重启 `server.py`。**不用改代码，不用重新生成模型，不用动 `directions.json` 和 `poses/`。**
+
+- `servo.json` 只放 ID 以外的东西：中文名（`cn`）、分组（`group`）、显示顺序（数组顺序）。漏写的关节会按 `installation.json` 的顺序补在后面，中文名用英文名；`installation.json` 里没有的会跳过。
+- 想用另一份编号文件（比如试装第二台鸭子）：`--installation /path/to/xxx.json`，或环境变量 `SERVO_INSTALLATION`。启动日志和页面左上角会写用的是哪个文件。
+- `directions.json` 按**关节名**存方向（如 `"left_knee": -1`），写了的覆盖 `installation.json` 的 `direction`，没写的用后者。老的按数字写的文件照样认。
+- 姿态（`poses/*.json`）每行都带 `joint` 名字，换编号后自动跟到新 ID；很老的文件只有 `id`，那就还按 id 来。
+- 改完编号先 `python joints.py` 看一眼表对不对。
+
 ## 注意
 
 - **URT-2 先插 USB，再给舵机上电。** 反了总线电平会卡在 2.1 V，扫描一颗都没有、只有广播能收到几个 0，见[踩坑记录](../../踩坑记录.md#工具)。
@@ -180,6 +192,7 @@ Node.js 只用于前端数学测试，正常使用调试台不需要。固件主
 
 | 版本 | 日期 | 改了什么 |
 |---|---|---|
+| 0.16.12 | 2026-11-12 | **舵机编号收进一个文件**：ID 的唯一真源是仓库根的 `radxa/installation.json`（`robotd` 读的也是它），网页不再自己维护一套。新增 `joints.py`（加载器）和 `servo.json`（只放中文名、分组、显示顺序，不写 ID）。原来写死在 `server.py` 的 `JOINT_NAMES`/`OFFICIAL_FOLD`/`FOLD_CALIB`、`app.js` 的 `CN`/`ORDER`/`DEFAULT_POSITION`/`OFFICIAL_POSES`/灵动动作/校准提示、`servo_report.py` 的 `NAMES`、`build_model.py` 的 `JOINT_IDS`，全改成按关节名查；`directions.json` 也改成按关节名存（老的按数字写的照样认），没写的直接用 installation.json 的 `direction`。`viewer.js` 的 3D 关节也按名字对 —— **换编号不用重新生成模型、不用改这些表**。换了编号以后老姿态靠每行的 `joint` 字段自动跟到新 ID（只有 `id` 的老文件照旧用 id）。启动日志和页面左上角会写明编号取自哪个文件；`--installation` / `SERVO_INSTALLATION` 可临时换一份。`poses/`、`calib/` 是数据目录，格式没变 |
 | 0.16.11 | 2026-10-26 | 新增「刚度」页：每颗舵机的 P/D 一览，能读、能改、能单颗写。起因是查小碎步 —— 上电默认（EEPROM 21/22）读出来是 32，就以为舵机是硬的，其实**跑起来用的是 SRAM 50/51**，出厂 32 只是掉电后的默认值，官方运行时早就把它改写成 6/20 了。寄存器和这两套值以前都得靠「单颗操作 → 写寄存器」手填地址，50/51 连名字都没有。这次把 50/51 加进 `feetech.REGISTERS`（所以「导出寄存器」和写寄存器下拉里也看得见了），21/22 的名字改成「上电默认值」，并加两个 op：`gains` 一次读全部（上电默认 P/D、运行 P/D、扭矩），`write_gains` 只写 50/51、不解锁 EEPROM、写完逐颗回读比对。**改这里只影响 servo-web 手操**：robotd 每次上电都会把运行值写回 6/20（嘴 10），重启就覆盖；反过来想撤销实验，给舵机断一次电就行 |
 | 0.16.10 | 2026-10-15 | IMU 面板只画「这条路确定填得上」的格子。总线（ID 200 那 15 个字节）只捎陀螺 + 四元数 + 采样计数 + 状态位，没有加速度、没有 SPI / FIFO 计数、没有参考电压 —— 那几格挂「—」看着像掉数据或者坏了，其实这条路上这个量压根不存在，留着不如不画。做法：每格包一层 `.imuF` 并标上 `data-cap`，「 · 」单独成 `.sep`；`viewer.js` 的 `renderImuCaps()` 按 `IMU_CAPS` 把填不上的整格收掉，分隔号跟着两边邻居一起收（不然会剩一个孤零零的「 · 」），一行里全收光就把这一行也收掉。走哪条路看帧里的 `backend` / `mode`，连「正在连接」那帧都带，所以第一帧之后就不会再变、不会闪。顺带删掉 `imuVoltage` 里那句 `demo ? '—'`（demo 的参考电压格现在整格不画，那句成了死代码）。**注意**：板子的寄存器表里其实是有加速度的（`control_table.c` 把 `raw_accel` 放在 136、`spi_errors` 在 172、`fifo_overflows` 在 176，读回调读哪个地址都行），是现在读的那个窗口「地址 56 起 15 字节」避开了它们 —— 哪天要让总线也显示这几个量，改的是 `imu200.py` 去读哪个地址，不是这张能力表 |
 | 0.16.9 | 2026-10-15 | IMU 面板改成自动高度。它原来 `top` 和 `bottom` 两头都钉死，框一路拉到滑块条上方；但 0.16.7/0.16.8 连着瘦了三处（安装方向下拉、`imuViewStatus` 那一条、`imuMessage` 平时也收起来），内容只占上半截，下面空出一大块带边框的空框。现在只钉 `top`，宽度不变，用 `max-height:calc(100% - 44px - var(--stripH) - 56px)` 顶替原来那条 `bottom` —— 能长到的高度跟以前一模一样（让开滑块条 `--stripH` 和它下面那行通栏的重心投影 44+12），超过了才在框里滚。实测：1080p 下框高从撑满的 551px 变成 302px（内容 299px），`max-height` 算出来仍是 551px，`scrollHeight == clientHeight`（没白留滚）|
@@ -228,6 +241,7 @@ Node.js 只用于前端数学测试，正常使用调试台不需要。固件主
 |---|---|
 | `start.sh` | 一键启动：备好 venv 和依赖，不带参数就接真机（`/dev/ttyUSB0` + 总线读 ID 200）；不接硬件看界面用 `--fake` |
 | `server.py` | HTTP + WebSocket 服务，starlette + uvicorn |
+| `joints.py` / `servo.json` | 舵机编号的唯一入口：读 `radxa/installation.json`（ID）+ `servo.json`（中文名、分组、顺序）。所有工具都从这儿查编号 |
 | `feetech.py` | 飞特协议：PING / READ / WRITE / SYNC_READ / SYNC_WRITE / REBOOT，寄存器名表 |
 | `sim_bus.py` / `selftest.py` | 协议级舵机模拟器 / 后端自检 |
 | `servo_report.py` / `test_servo_report.py` | 舵机体检（只读）/ 对着 `sim_bus` 的测试 |
